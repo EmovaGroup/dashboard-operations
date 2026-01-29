@@ -1,25 +1,20 @@
 # pages/3_Achats.py
 # =============================================================================
-# PAGE : ACHATS
+# PAGE : ACHATS (A vs B) — avec parcs séparés A/B (fix filtres)
 # =============================================================================
 # Objectif :
-# - Comparer 2 opérations (Année N vs Année N-1) sur les achats
+# - Comparer 2 opérations (A vs B) sur les achats
 # - 2 modes :
 #   1) Mode magasin : si un code_magasin est sélectionné -> fiche magasin + KPI + table PUM
-#   2) Mode parc : sinon -> KPI parc + camemberts (répartition magasins par fournisseur) + table PUM
+#   2) Mode parc : sinon -> KPI parc + camemberts + table PUM
 #
-# Règles métiers :
-# - Valeur achats = NET (champ "total achat")
-# - Quantités = champ quantite
-# - PUM = Somme(valeur NET) / Somme(quantités)  (pondéré)
+# Fix majeur filtres :
+# ✅ On utilise maintenant 2 parcs distincts :
+#    - mags_cte_sql_A / mags_cte_params_A  (parc pour l'opération A)
+#    - mags_cte_sql_B / mags_cte_params_B  (parc pour l'opération B)
 #
-# Fournisseurs :
-# - On ne se base PAS sur le fournisseur brut
-# - On se base sur la vue normalisée : public.vw_op_achats_norm (fournisseur_norm)
-#
-# UX :
-# - Couleurs homogènes + légende à droite
-# - Message clair quand il n’y a aucune donnée sur la période / filtres
+# Bonus demandé “comme Marketing” :
+# ✅ Ajout au-dessus des KPI achats : CA total, Tickets total, Panier moyen (sur la période de l'op)
 # =============================================================================
 
 import streamlit as st
@@ -61,15 +56,24 @@ ctx = render_filters()
 
 code_opA = ctx["opA"]["code"]
 lib_opA = ctx["opA"]["lib"]
+dateA0 = str(ctx["opA"]["date_debut"])
+dateA1 = str(ctx["opA"]["date_fin"])
+
 code_opB = ctx["opB"]["code"]
 lib_opB = ctx["opB"]["lib"]
+dateB0 = str(ctx["opB"]["date_debut"])
+dateB1 = str(ctx["opB"]["date_fin"])
 
-mags_cte_sql = ctx["mags_cte_sql"]
-mags_cte_params = ctx["mags_cte_params"]
+# ✅ IMPORTANT : parcs séparés A / B (fix)
+mags_cte_sql_A = ctx["mags_cte_sql_A"]
+mags_cte_params_A = ctx["mags_cte_params_A"]
+
+mags_cte_sql_B = ctx["mags_cte_sql_B"]
+mags_cte_params_B = ctx["mags_cte_params_B"]
 
 code_magasin_selected = ctx["filters"]["code_magasin"]
 
-st.caption(f"Année N : **{lib_opA}**  |  Année N-1 : **{lib_opB}**")
+st.caption(f"Opération A : **{lib_opA}**  |  Opération B : **{lib_opB}**")
 
 # -----------------------------------------------------------------------------
 # Source achats normalisée
@@ -87,15 +91,6 @@ def _f0(x) -> float:
         return float(x)
     except Exception:
         return 0.0
-
-
-def _i0(x) -> int:
-    try:
-        if x is None:
-            return 0
-        return int(x)
-    except Exception:
-        return 0
 
 
 # =============================================================================
@@ -126,6 +121,43 @@ def build_color_map(labels: list[str]) -> dict:
             cmap[lab] = BASE_PALETTE[i % len(BASE_PALETTE)]
             i += 1
     return cmap
+
+
+# =============================================================================
+# COMMERCE LIGHT — CA / Tickets / PM (sur la période)
+# =============================================================================
+@st.cache_data(ttl=600)
+def load_commerce_light(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> dict:
+    sql = f"""
+{mags_cte_sql_},
+
+base as (
+  select
+    trim(st.code_magasin::text) as code_magasin,
+    st.ticket_date,
+    coalesce(st.nb_tickets, 0)::numeric as nb_tickets,
+    coalesce(st.total_ttc_net, 0)::numeric as ca_ttc_net
+  from public.vw_gold_tickets_jour_clean_op st
+  join mags m on m.code_magasin = trim(st.code_magasin::text)
+  where st.ticket_date >= %s::date
+    and st.ticket_date <= %s::date
+)
+select
+  round(coalesce(sum(ca_ttc_net),0), 2) as ca_total,
+  round(coalesce(sum(nb_tickets),0), 0) as tickets_total,
+  round(coalesce(sum(ca_ttc_net),0) / nullif(coalesce(sum(nb_tickets),0),0), 2) as panier_moyen
+from base;
+"""
+    df = read_df(sql, params=tuple(list(mags_cte_params_) + [date_debut, date_fin]))
+    if df.empty:
+        return {"ca_total": 0.0, "tickets_total": 0.0, "panier_moyen": 0.0}
+
+    r = df.iloc[0].to_dict()
+    return {
+        "ca_total": _f0(r.get("ca_total")),
+        "tickets_total": _f0(r.get("tickets_total")),
+        "panier_moyen": _f0(r.get("panier_moyen")),
+    }
 
 
 # =============================================================================
@@ -222,49 +254,48 @@ def render_magasin_fiche(code_magasin: str):
 
 
 # =============================================================================
-# HELPERS SQL PARC
+# HELPERS SQL PARC (fix : prend le mags_cte_* en paramètre)
 # =============================================================================
-def _parc_analysis_cte(code_op: str) -> tuple[str, tuple]:
+def _parc_analysis_cte(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> tuple[str, tuple]:
     """
     Parc d'analyse :
-    - Base = mags (déjà filtré par filters.py : région, type, seg, rcr, etc.)
+    - Base = mags (déjà filtré par filters.py)
     - Actif / Ouverture
     - On garde aussi les acheteurs OP, mais uniquement si le magasin est déjà dans mags_dist
-      => aucun magasin hors filtre ne revient
     """
     sql = f"""
-    {mags_cte_sql},
+{mags_cte_sql_},
 
-    mags_dist as (
-      select distinct code_magasin
-      from mags
-      where code_magasin is not null
-    ),
+mags_dist as (
+  select distinct code_magasin
+  from mags
+  where code_magasin is not null
+),
 
-    mags_actifs as (
-      select md.code_magasin
-      from mags_dist md
-      join public.ref_magasin rm
-        on trim(rm.code_magasin::text) = md.code_magasin
-      where rm.statut in ('Actif','Ouverture')
-    ),
+mags_actifs as (
+  select md.code_magasin
+  from mags_dist md
+  join public.ref_magasin rm
+    on trim(rm.code_magasin::text) = md.code_magasin
+  where rm.statut in ('Actif','Ouverture')
+),
 
-    mags_acheteurs_op as (
-      select distinct trim(a.code_magasin::text) as code_magasin
-      from {ACHATS_SRC} a
-      join mags_dist md
-        on md.code_magasin = trim(a.code_magasin::text)
-      where a.code_operation = %s
-        and a.code_magasin is not null
-    ),
+mags_acheteurs_op as (
+  select distinct trim(a.code_magasin::text) as code_magasin
+  from {ACHATS_SRC} a
+  join mags_dist md
+    on md.code_magasin = trim(a.code_magasin::text)
+  where a.code_operation = %s
+    and a.code_magasin is not null
+),
 
-    parc_analysis as (
-      select code_magasin from mags_actifs
-      union
-      select code_magasin from mags_acheteurs_op
-    )
-    """
-    return sql, (*mags_cte_params, code_op)
+parc_analysis as (
+  select code_magasin from mags_actifs
+  union
+  select code_magasin from mags_acheteurs_op
+)
+"""
+    return sql, tuple(list(mags_cte_params_) + [code_op])
 
 
 # =============================================================================
@@ -272,27 +303,27 @@ def _parc_analysis_cte(code_op: str) -> tuple[str, tuple]:
 # =============================================================================
 def has_data_for_magasin(code_op: str, code_magasin: str) -> bool:
     sql = f"""
-    select 1
-    from {ACHATS_SRC} a
-    where a.code_operation = %s
-      and trim(a.code_magasin::text) = %s
-    limit 1;
-    """
+select 1
+from {ACHATS_SRC} a
+where a.code_operation = %s
+  and trim(a.code_magasin::text) = %s
+limit 1;
+"""
     df = read_df(sql, params=(code_op, code_magasin))
     return not df.empty
 
 
-def has_data_for_parc(code_op: str) -> bool:
-    parc_sql, parc_params = _parc_analysis_cte(code_op)
+def has_data_for_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> bool:
+    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
     sql = f"""
-    {parc_sql}
-    select 1
-    from {ACHATS_SRC} a
-    join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-    where a.code_operation = %s
-    limit 1;
-    """
-    df = read_df(sql, params=(*parc_params, code_op))
+{parc_sql}
+select 1
+from {ACHATS_SRC} a
+join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
+where a.code_operation = %s
+limit 1;
+"""
+    df = read_df(sql, params=tuple(list(parc_params) + [code_op]))
     return not df.empty
 
 
@@ -310,14 +341,14 @@ def no_data_block(msg: str):
 # =============================================================================
 def achats_kpi_magasin(code_op: str, code_magasin: str) -> pd.Series:
     sql = f"""
-    select
-      coalesce(sum(a."total achat"),0) as valeur_achats_captee,
-      coalesce(sum(a.quantite),0) as volume_achats_capte,
-      coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
-    from {ACHATS_SRC} a
-    where a.code_operation = %s
-      and trim(a.code_magasin::text) = %s;
-    """
+select
+  coalesce(sum(a."total achat"),0) as valeur_achats_captee,
+  coalesce(sum(a.quantite),0) as volume_achats_capte,
+  coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
+from {ACHATS_SRC} a
+where a.code_operation = %s
+  and trim(a.code_magasin::text) = %s;
+"""
     df = read_df(sql, params=(code_op, code_magasin))
     if df.empty:
         return pd.Series({"valeur_achats_captee": 0, "volume_achats_capte": 0, "pum": 0})
@@ -326,60 +357,60 @@ def achats_kpi_magasin(code_op: str, code_magasin: str) -> pd.Series:
 
 def pum_par_fournisseur_magasin(code_op: str, code_magasin: str) -> pd.DataFrame:
     sql = f"""
-    select
-      coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
-      coalesce(sum(a.quantite),0) as qte,
-      coalesce(sum(a."total achat"),0) as valeur,
-      coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
-    from {ACHATS_SRC} a
-    where a.code_operation = %s
-      and trim(a.code_magasin::text) = %s
-    group by 1
-    order by valeur desc;
-    """
+select
+  coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
+  coalesce(sum(a.quantite),0) as qte,
+  coalesce(sum(a."total achat"),0) as valeur,
+  coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
+from {ACHATS_SRC} a
+where a.code_operation = %s
+  and trim(a.code_magasin::text) = %s
+group by 1
+order by valeur desc;
+"""
     return read_df(sql, params=(code_op, code_magasin))
 
 
 # =============================================================================
-# MODE PARC : KPI + camemberts + table PUM
+# MODE PARC : KPI + camemberts + table PUM (fix : parc A/B séparés)
 # =============================================================================
-def achats_kpi_parc(code_op: str) -> pd.Series:
-    parc_sql, parc_params = _parc_analysis_cte(code_op)
+def achats_kpi_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.Series:
+    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
     sql = f"""
-    {parc_sql},
+{parc_sql},
 
-    achats_capt as (
-      select
-        trim(a.code_magasin::text) as code_magasin,
-        coalesce(sum(a."total achat"),0) as valeur_achats,
-        coalesce(sum(a.quantite),0) as volume_achats
-      from {ACHATS_SRC} a
-      join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-      where a.code_operation = %s
-      group by 1
-    ),
+achats_capt as (
+  select
+    trim(a.code_magasin::text) as code_magasin,
+    coalesce(sum(a."total achat"),0) as valeur_achats,
+    coalesce(sum(a.quantite),0) as volume_achats
+  from {ACHATS_SRC} a
+  join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
+  where a.code_operation = %s
+  group by 1
+),
 
-    parc as (select count(*) as nb_mag_parc from parc_analysis),
-    acheteurs as (select count(*) as nb_mag_acheteurs from achats_capt where valeur_achats > 0),
+parc as (select count(*) as nb_mag_parc from parc_analysis),
+acheteurs as (select count(*) as nb_mag_acheteurs from achats_capt where valeur_achats > 0),
 
-    agg as (
-      select
-        coalesce(sum(ac.valeur_achats),0) as valeur_achats_captee,
-        coalesce(sum(ac.volume_achats),0) as volume_achats_capte,
-        (select nb_mag_parc from parc) as nb_mag_parc,
-        (select nb_mag_acheteurs from acheteurs) as nb_mag_acheteurs
-      from achats_capt ac
-    )
+agg as (
+  select
+    coalesce(sum(ac.valeur_achats),0) as valeur_achats_captee,
+    coalesce(sum(ac.volume_achats),0) as volume_achats_capte,
+    (select nb_mag_parc from parc) as nb_mag_parc,
+    (select nb_mag_acheteurs from acheteurs) as nb_mag_acheteurs
+  from achats_capt ac
+)
 
-    select
-      coalesce(valeur_achats_captee,0) as valeur_achats_captee,
-      coalesce(volume_achats_capte,0)  as volume_achats_capte,
-      coalesce(nb_mag_parc,0)          as nb_mag_parc,
-      coalesce(nb_mag_acheteurs,0)     as nb_mag_acheteurs,
-      coalesce(round(nb_mag_acheteurs::numeric / nullif(nb_mag_parc,0) * 100, 1), 0) as pct_mag_acheteurs
-    from agg;
-    """
-    df = read_df(sql, params=(*parc_params, code_op))
+select
+  coalesce(valeur_achats_captee,0) as valeur_achats_captee,
+  coalesce(volume_achats_capte,0)  as volume_achats_capte,
+  coalesce(nb_mag_parc,0)          as nb_mag_parc,
+  coalesce(nb_mag_acheteurs,0)     as nb_mag_acheteurs,
+  coalesce(round(nb_mag_acheteurs::numeric / nullif(nb_mag_parc,0) * 100, 1), 0) as pct_mag_acheteurs
+from agg;
+"""
+    df = read_df(sql, params=tuple(list(parc_params) + [code_op]))
     if df.empty:
         return pd.Series(
             {
@@ -393,92 +424,92 @@ def achats_kpi_parc(code_op: str) -> pd.Series:
     return df.iloc[0]
 
 
-def camembert_fusion_magasin_parc(code_op: str, top_n_fournisseurs: int = 12) -> pd.DataFrame:
-    parc_sql, parc_params = _parc_analysis_cte(code_op)
+def camembert_fusion_magasin_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str, top_n_fournisseurs: int = 12) -> pd.DataFrame:
+    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
     sql = f"""
-    {parc_sql},
+{parc_sql},
 
-    achats_mag_fourn as (
-      select
-        trim(a.code_magasin::text) as code_magasin,
-        coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
-        coalesce(sum(a."total achat"),0) as valeur
-      from {ACHATS_SRC} a
-      join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-      where a.code_operation = %s
-      group by 1,2
-    ),
+achats_mag_fourn as (
+  select
+    trim(a.code_magasin::text) as code_magasin,
+    coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
+    coalesce(sum(a."total achat"),0) as valeur
+  from {ACHATS_SRC} a
+  join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
+  where a.code_operation = %s
+  group by 1,2
+),
 
-    best_fourn as (
-      select code_magasin, fournisseur
-      from (
-        select
-          code_magasin,
-          fournisseur,
-          valeur,
-          row_number() over (partition by code_magasin order by valeur desc) as rn
-        from achats_mag_fourn
-      ) t
-      where rn = 1
-    ),
-
-    capt_counts as (
-      select fournisseur, count(*)::int as nb_mag
-      from best_fourn
-      group by 1
-      order by nb_mag desc
-    ),
-
-    capt_top as (
-      select fournisseur, nb_mag
-      from capt_counts
-      order by nb_mag desc
-      limit {int(top_n_fournisseurs)}
-    ),
-
-    capt_rest as (
-      select 'Autres fournisseurs (captés)'::text as fournisseur, coalesce(sum(nb_mag),0)::int as nb_mag
-      from capt_counts
-      where fournisseur not in (select fournisseur from capt_top)
-    ),
-
-    parc_sans_achats as (
-      select p.code_magasin
-      from parc_analysis p
-      left join best_fourn bf on bf.code_magasin = p.code_magasin
-      where bf.code_magasin is null
-    ),
-
-    autres_non_captes as (
-      select 'Autres fournisseurs (non captés)'::text as fournisseur, count(*)::int as nb_mag
-      from parc_sans_achats
-    )
-
-    select fournisseur, nb_mag from capt_top
-    union all
-    select fournisseur, nb_mag from capt_rest where nb_mag > 0
-    union all
-    select fournisseur, nb_mag from autres_non_captes;
-    """
-    return read_df(sql, params=(*parc_params, code_op))
-
-
-def pum_par_fournisseur_parc(code_op: str) -> pd.DataFrame:
-    parc_sql, parc_params = _parc_analysis_cte(code_op)
-    sql = f"""
-    {parc_sql}
+best_fourn as (
+  select code_magasin, fournisseur
+  from (
     select
-      coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
-      coalesce(sum(a.quantite),0) as qte,
-      coalesce(sum(a."total achat"),0) as valeur,
-      coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
-    from {ACHATS_SRC} a
-    join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-    where a.code_operation = %s
-    group by 1
-    order by valeur desc;
-    """
-    return read_df(sql, params=(*parc_params, code_op))
+      code_magasin,
+      fournisseur,
+      valeur,
+      row_number() over (partition by code_magasin order by valeur desc) as rn
+    from achats_mag_fourn
+  ) t
+  where rn = 1
+),
+
+capt_counts as (
+  select fournisseur, count(*)::int as nb_mag
+  from best_fourn
+  group by 1
+  order by nb_mag desc
+),
+
+capt_top as (
+  select fournisseur, nb_mag
+  from capt_counts
+  order by nb_mag desc
+  limit {int(top_n_fournisseurs)}
+),
+
+capt_rest as (
+  select 'Autres fournisseurs (captés)'::text as fournisseur, coalesce(sum(nb_mag),0)::int as nb_mag
+  from capt_counts
+  where fournisseur not in (select fournisseur from capt_top)
+),
+
+parc_sans_achats as (
+  select p.code_magasin
+  from parc_analysis p
+  left join best_fourn bf on bf.code_magasin = p.code_magasin
+  where bf.code_magasin is null
+),
+
+autres_non_captes as (
+  select 'Autres fournisseurs (non captés)'::text as fournisseur, count(*)::int as nb_mag
+  from parc_sans_achats
+)
+
+select fournisseur, nb_mag from capt_top
+union all
+select fournisseur, nb_mag from capt_rest where nb_mag > 0
+union all
+select fournisseur, nb_mag from autres_non_captes;
+"""
+    return read_df(sql, params=tuple(list(parc_params) + [code_op]))
+
+
+def pum_par_fournisseur_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.DataFrame:
+    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+    sql = f"""
+{parc_sql}
+select
+  coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
+  coalesce(sum(a.quantite),0) as qte,
+  coalesce(sum(a."total achat"),0) as valeur,
+  coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
+from {ACHATS_SRC} a
+join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
+where a.code_operation = %s
+group by 1
+order by valeur desc;
+"""
+    return read_df(sql, params=tuple(list(parc_params) + [code_op]))
 
 
 def render_pie_with_shared_palette(df: pd.DataFrame, all_labels: list[str], color_map: dict):
@@ -508,14 +539,29 @@ def render_pie_with_shared_palette(df: pd.DataFrame, all_labels: list[str], colo
 
 
 # =============================================================================
+# EN-TÊTE : KPI COMMERCE au-dessus (comme Marketing)
+# =============================================================================
+st.markdown("## 🧾 Contexte commerce (sur la période) — A vs B")
+cA = load_commerce_light(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
+cB = load_commerce_light(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
+
+cc = st.columns(3)
+with cc[0]:
+    kpi_card_compare("CA total", cA["ca_total"], cB["ca_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+with cc[1]:
+    kpi_card_compare("Tickets total", cA["tickets_total"], cB["tickets_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+with cc[2]:
+    kpi_card_compare("Panier moyen", cA["panier_moyen"], cB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+
+st.divider()
+
+# =============================================================================
 # RENDER
 # =============================================================================
 if code_magasin_selected:
     # --- check data magasin (sur OP A) ---
     if not has_data_for_magasin(code_opA, code_magasin_selected):
-        no_data_block(
-            f"Magasin **{code_magasin_selected}** : aucune ligne d’achat sur **{lib_opA}**."
-        )
+        no_data_block(f"Magasin **{code_magasin_selected}** : aucune ligne d’achat sur **{lib_opA}**.")
 
     st.markdown("## 🏬 Magasin sélectionné")
     render_magasin_fiche(code_magasin_selected)
@@ -536,7 +582,6 @@ if code_magasin_selected:
             label_n1=lib_opB,
             formatter=lambda x: fmt_money(x, 0),
         )
-
     with c2:
         kpi_card_compare(
             title="Volume achats (qte)",
@@ -546,7 +591,6 @@ if code_magasin_selected:
             label_n1=lib_opB,
             formatter=lambda x: fmt_int(x),
         )
-
     with c3:
         kpi_card_compare(
             title="PUM (Valeur NET / Quantité)",
@@ -564,12 +608,8 @@ if code_magasin_selected:
 
     top_n = st.slider("Top N fournisseurs (table PUM par valeur N)", min_value=3, max_value=30, value=12, step=1)
 
-    pumA = pum_par_fournisseur_magasin(code_opA, code_magasin_selected).rename(
-        columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
-    )
-    pumB = pum_par_fournisseur_magasin(code_opB, code_magasin_selected).rename(
-        columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
-    )
+    pumA = pum_par_fournisseur_magasin(code_opA, code_magasin_selected).rename(columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"})
+    pumB = pum_par_fournisseur_magasin(code_opB, code_magasin_selected).rename(columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"})
 
     merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
     merged = merged.sort_values("valeur_A", ascending=False).head(top_n)
@@ -580,29 +620,27 @@ if code_magasin_selected:
     )
 
     display_df = merged.copy()
-    display_df["PUM N"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
-    display_df["PUM N-1"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
+    display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
+    display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
     display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
-    display_df["Valeur N (NET)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
-    display_df["Valeur N-1 (NET)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
-    display_df["Qte N"] = display_df["qte_A"].apply(fmt_int)
-    display_df["Qte N-1"] = display_df["qte_B"].apply(fmt_int)
+    display_df["Valeur A (NET)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
+    display_df["Valeur B (NET)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
+    display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
+    display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
 
     st.dataframe(
-        display_df[
-            ["fournisseur", "PUM N", "PUM N-1", "Δ PUM %", "Valeur N (NET)", "Valeur N-1 (NET)", "Qte N", "Qte N-1"]
-        ],
+        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (NET)", "Valeur B (NET)", "Qte A", "Qte B"]],
         use_container_width=True,
         hide_index=True,
     )
 
 else:
-    # --- check data parc (sur OP A) ---
-    if not has_data_for_parc(code_opA):
+    # --- check data parc (sur OP A, parc A) ---
+    if not has_data_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA):
         no_data_block(f"Aucune ligne d’achat sur **{lib_opA}** avec les filtres actuels.")
 
-    kA = achats_kpi_parc(code_opA)
-    kB = achats_kpi_parc(code_opB)
+    kA = achats_kpi_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
+    kB = achats_kpi_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
     st.markdown("## 🧾 Achats – Synthèse")
 
@@ -652,18 +690,16 @@ else:
             value_n1=_f0(kB.get("pct_mag_acheteurs")),
             label_n=lib_opA,
             label_n1=lib_opB,
-            formatter=lambda x: f"{x:.1f} %",
+            formatter=lambda x: f"{float(x or 0):.1f} %",
         )
 
     st.divider()
 
     st.markdown("## 🥧 Répartition des magasins selon le fournisseur d’achat")
-    st.caption(
-        "Répartition en **nombre de magasins** : chaque magasin capté est affecté à son **fournisseur principal** (valeur d’achat max)."
-    )
+    st.caption("Répartition en **nombre de magasins** : chaque magasin capté est affecté à son **fournisseur principal** (valeur d’achat max).")
 
-    dfA = camembert_fusion_magasin_parc(code_opA, top_n_fournisseurs=12)
-    dfB = camembert_fusion_magasin_parc(code_opB, top_n_fournisseurs=12)
+    dfA = camembert_fusion_magasin_parc(mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12)
+    dfB = camembert_fusion_magasin_parc(mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12)
 
     all_labels = sorted(set(dfA["fournisseur"].tolist()) | set(dfB["fournisseur"].tolist()))
     non_captes = "Autres fournisseurs (non captés)"
@@ -685,10 +721,10 @@ else:
     st.markdown("## 💶 Prix unitaire moyen (PUM) par fournisseur")
     st.caption("PUM = **Somme(Valeur achats NET) / Somme(Quantités)** (pondéré).")
 
-    top_n = st.slider("Top N fournisseurs (table PUM par valeur N)", min_value=3, max_value=30, value=12, step=1)
+    top_n = st.slider("Top N fournisseurs (table PUM par valeur A)", min_value=3, max_value=30, value=12, step=1)
 
-    pumA = pum_par_fournisseur_parc(code_opA).rename(columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"})
-    pumB = pum_par_fournisseur_parc(code_opB).rename(columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"})
+    pumA = pum_par_fournisseur_parc(mags_cte_sql_A, mags_cte_params_A, code_opA).rename(columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"})
+    pumB = pum_par_fournisseur_parc(mags_cte_sql_B, mags_cte_params_B, code_opB).rename(columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"})
 
     merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
     merged = merged.sort_values("valeur_A", ascending=False).head(top_n)
@@ -699,18 +735,16 @@ else:
     )
 
     display_df = merged.copy()
-    display_df["PUM N"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
-    display_df["PUM N-1"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
+    display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
+    display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
     display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
-    display_df["Valeur N (NET)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
-    display_df["Valeur N-1 (NET)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
-    display_df["Qte N"] = display_df["qte_A"].apply(fmt_int)
-    display_df["Qte N-1"] = display_df["qte_B"].apply(fmt_int)
+    display_df["Valeur A (NET)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
+    display_df["Valeur B (NET)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
+    display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
+    display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
 
     st.dataframe(
-        display_df[
-            ["fournisseur", "PUM N", "PUM N-1", "Δ PUM %", "Valeur N (NET)", "Valeur N-1 (NET)", "Qte N", "Qte N-1"]
-        ],
+        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (NET)", "Valeur B (NET)", "Qte A", "Qte B"]],
         use_container_width=True,
         hide_index=True,
     )
