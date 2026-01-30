@@ -2,26 +2,22 @@
 # -----------------------------------------------------------------------------
 # MARKETING — Dashboard (A vs B)
 #
-# ✅ Correctifs inclus :
-# - Parcs séparés A / B : mags_cte_sql_A + mags_cte_sql_B
-# - KPI "Contexte commerce" au-dessus (CA, Tickets, PM) via vw_gold_tickets_jour_clean_op
-# - Suppression du KPI "Taux d’encartement (global)"
-# - KPI séparés : Nb magasins ERMES / Nb magasins KTB
-# - Ajout : nb clients fidèles consommateurs (ori_ktb.ca_actifs) + CA actifs (ori_ktb.ca_actifs)
-# - Régressions : rendu "comme screenshot" (points + ligne) + R² en légende
-#   + hover = code magasin + invest + poids + opération
-# - Sécurisation des types numériques (plus d'erreur format 'f' sur str)
+# ✅ Basé sur ta table ERMES :
+# public.ori_ermes(code_operation, ..., pack numeric, ...)
 #
-# ⚠️ Hypothèses / conventions :
+# ✅ Hypothèses / conventions :
 # - Investissement ERMES = ori_ermes.pack
 # - Investissement FID = vw_ktb_with_sms_cost.cout_sms_total_eur
 # - Nb magasins pack ERMES = count(distinct code_magasin) dans ori_ermes sur l'op
 # - Nb magasins KTB = count(distinct code_magasin) dans vw_ktb_with_sms_cost sur l'op
-# - Clients fidèles consommateurs = sum(ori_ktb.ca_actifs) ? (selon ton besoin)
-#   -> Ici : on affiche 2 KPI :
-#      1) Nb clients fidèles actifs = sum(ori_ktb.ca_actifs) (si ca_actifs = nb clients)
-#      2) CA généré par les actifs = sum(ori_ktb.ca_actifs) (si ca_actifs = CA)
-#   👉 Si ca_actifs est bien du CA (et pas un nombre), garde uniquement le KPI "CA actifs".
+# - CA actifs = sum(ori_ktb.ca_actifs)
+#
+# ✅ Correctifs inclus :
+# - Parcs séparés A / B : mags_cte_sql_A + mags_cte_sql_B (via render_filters)
+# - Types numériques sécurisés (pack est numeric => pas de COALESCE texte/int)
+# - KPI commerce (CA/tickets/PM) au-dessus
+# - KPI ERMES/KTB séparés + % sur parc
+# - Tables région + pack distribution + régressions (points + fit + R²)
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -50,6 +46,8 @@ POIDS_MV_MAP = {
     "noel_2024": "public.mv_noel_2024_poids_op_periode_op_magasin",
     "anniversaire_2025": "public.mv_anniversaire_2025_poids_op_periode_op_magasin",
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
+    # 👉 Ajoute ici tulipe si tu as une MV poids
+    # "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
 }
 
 # =============================================================================
@@ -231,8 +229,6 @@ from base;
 
 # =============================================================================
 # Loader — métriques marketing (A ou B) sur le parc filtré
-# + séparation nb magasins ERMES / nb magasins KTB
-# + ajout ca_actifs (ori_ktb)
 # =============================================================================
 @st.cache_data(ttl=600)
 def load_marketing_metrics(mags_cte_sql_: str, mags_cte_params_: tuple, code_operation: str) -> dict:
@@ -270,7 +266,6 @@ ktb_cost_mags as (
   select k.* from ktb_cost k join mags m using(code_magasin)
 ),
 
--- 🔥 ori_ktb : KPI "ca_actifs"
 ktb_ori as (
   select
     trim(o.code_magasin::text) as code_magasin,
@@ -287,7 +282,6 @@ agg as (
   select
     (select parc_magasin from parc) as parc_magasin,
 
-    -- ✅ séparés
     (select count(distinct code_magasin) from ermes_mags) as nb_mag_ermes,
     (select count(distinct code_magasin) from ktb_cost_mags) as nb_mag_ktb,
 
@@ -309,10 +303,8 @@ agg as (
       from ktb_cost_mags
     ) as tx_activation_moyen,
 
-    -- ✅ CA actifs (ori_ktb)
     (select coalesce(sum(ca_actifs), 0) from ktb_ori_mags) as ca_actifs_total,
 
-    -- Parc "marketing" (ermes OU ktb)
     (select count(*) from (
         select code_magasin from ermes_mags
         union
@@ -342,7 +334,6 @@ select
   round(100 * nb_mag_marketing::numeric / nullif(parc_magasin, 0), 2) as pct_mag_marketing,
 
   round(coalesce(tx_activation_moyen, 0), 6) as tx_activation_moyen,
-
   round(coalesce(ca_actifs_total, 0), 2) as ca_actifs_total
 from agg;
 """
@@ -350,24 +341,27 @@ from agg;
 
     keys = [
         "parc_magasin",
-        "nb_mag_marketing", "pct_mag_marketing",
-
-        "nb_mag_ermes", "invest_ermes_total_eur", "invest_ermes_moy_eur", "pct_mag_ermes",
-        "nb_mag_ktb", "nb_sms_total", "invest_ktb_total_eur", "invest_ktb_moy_eur", "pct_mag_ktb",
-
-        "invest_total_eur", "invest_total_moy_eur",
+        "nb_mag_marketing",
+        "pct_mag_marketing",
+        "nb_mag_ermes",
+        "invest_ermes_total_eur",
+        "invest_ermes_moy_eur",
+        "pct_mag_ermes",
+        "nb_mag_ktb",
+        "nb_sms_total",
+        "invest_ktb_total_eur",
+        "invest_ktb_moy_eur",
+        "pct_mag_ktb",
+        "invest_total_eur",
+        "invest_total_moy_eur",
         "tx_activation_moyen",
-
         "ca_actifs_total",
     ]
     if df.empty:
         return {k: 0.0 for k in keys}
 
     r = df.iloc[0].to_dict()
-    out = {}
-    for k in keys:
-        out[k] = _safe_float(r.get(k))
-    return out
+    return {k: _safe_float(r.get(k)) for k in keys}
 
 
 # =============================================================================
@@ -390,6 +384,7 @@ def _prettify_region_df(df: pd.DataFrame) -> pd.DataFrame:
     }
     out = out.rename(columns=rename)
 
+    int_cols = ["Nombre de magasins"]
     money_cols = [
         "Investissement total (€)",
         "Investissement ERMES (€)",
@@ -398,7 +393,6 @@ def _prettify_region_df(df: pd.DataFrame) -> pd.DataFrame:
         "Moyenne ERMES / magasin (€)",
         "Moyenne FID / magasin (€)",
     ]
-    int_cols = ["Nombre de magasins"]
 
     for c in int_cols:
         if c in out.columns:
@@ -471,8 +465,7 @@ order by invest_total_eur desc;
 """
     df = read_df(sql_region, tuple(list(mags_cte_params_) + [code_operation, code_operation]))
     st.markdown(f"### {title}")
-    df2 = _prettify_region_df(df)
-    _render_pretty_table(df2)
+    _render_pretty_table(_prettify_region_df(df))
 
 
 # =============================================================================
@@ -486,7 +479,7 @@ def load_pack_distribution(mags_cte_sql_: str, mags_cte_params_: tuple, code_ope
 ermes as (
   select
     trim(e.code_magasin::text) as code_magasin,
-    round(coalesce(e.pack, 0), 2) as pack_eur
+    round(coalesce(e.pack, 0)::numeric, 2) as pack_eur
   from public.ori_ermes e
   where e.code_operation = %s
     and e.code_magasin is not null
@@ -507,7 +500,7 @@ order by pack_eur;
 
 
 # =============================================================================
-# Loader — données régression (A ou B) — sécurisé types numériques
+# Loader — données régression (A ou B)
 # =============================================================================
 def _load_reg_data(
     code_operation: str,
@@ -615,7 +608,6 @@ require_auth()
 top_bar("Dashboard – Marketing")
 tabs_nav()
 st.divider()
-
 inject_kpi_compare_css()
 
 ctx = render_filters()
