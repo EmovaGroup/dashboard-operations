@@ -73,6 +73,14 @@ def load_ref_magasin_distincts() -> dict:
               and "crp_:_region_nationale_d_affectation" <> ''
             order by reg_admin;
         """)["reg_admin"].tolist(),
+
+        # ✅ NEW — Enseigne
+        "enseignes": read_df("""
+            select distinct enseigne
+            from public.ref_magasin
+            where enseigne is not null and enseigne <> ''
+            order by enseigne;
+        """)["enseigne"].tolist(),
     }
 
 
@@ -103,6 +111,9 @@ def _init_state():
     ss.setdefault("flt_reg_elargie", [])
     ss.setdefault("flt_reg_admin", [])
 
+    # ✅ NEW — Enseigne
+    ss.setdefault("flt_enseignes", [])
+
     ss.setdefault("filters_applied", False)
 
 
@@ -120,6 +131,7 @@ def build_mags_cte_sql(
     rcr: list[str],
     reg_elargie: list[str],
     reg_admin: list[str],
+    enseignes: list[str],  # ✅ NEW
 ) -> tuple[str, tuple]:
     """
     Construit le parc final "mags" en 3 étapes:
@@ -153,6 +165,11 @@ def build_mags_cte_sql(
     if reg_admin:
         where_parts.append('rm."crp_:_region_nationale_d_affectation" = any(%s)')
         params.append(reg_admin)
+
+    # ✅ NEW — filtre enseigne
+    if enseignes:
+        where_parts.append("rm.enseigne = any(%s)")
+        params.append(enseignes)
 
     where_sql = " AND ".join(where_parts)
 
@@ -257,7 +274,7 @@ mags as (
 
     final_params = []
     final_params += parc_params            # (optionnel) code_operation pour op_magasin
-    final_params += params                 # filtres ref_magasin
+    final_params += params                 # filtres ref_magasin (dont enseigne)
     final_params += [code_operation_ref]   # ermes_op
     final_params += [ermes_mode, ermes_mode, ermes_mode]
     final_params += [code_operation_ref]   # fid_op
@@ -289,7 +306,7 @@ def render_filters() -> dict:
     with st.expander("Filtres", expanded=True):
         with st.form("filters_form", clear_on_submit=False):
 
-            # ✅ 2 colonnes : gauche A / droite B (comme tu veux)
+            # ✅ 2 colonnes : gauche A / droite B
             left, right = st.columns(2)
 
             with left:
@@ -343,15 +360,24 @@ def render_filters() -> dict:
                 key="form_magasin",
             )
 
-            a, b, c = st.columns(3)
-            with a:
+            # ✅ Mise en page demandée :
+            # Ligne 1 : Région élargie | Région admin | Type magasin
+            row1_a, row1_b, row1_c = st.columns(3)
+            with row1_a:
                 reg_elargie = st.multiselect("Région élargie", refd["reg_elargie"], st.session_state["flt_reg_elargie"], key="form_reg_elargie")
-                rcr = st.multiselect("RCR", refd["rcr"], st.session_state["flt_rcr"], key="form_rcr")
-            with b:
+            with row1_b:
                 reg_admin = st.multiselect("Région admin", refd["reg_admin"], st.session_state["flt_reg_admin"], key="form_reg_admin")
-                seg = st.multiselect("Segmentation", refd["seg"], st.session_state["flt_seg"], key="form_seg")
-            with c:
+            with row1_c:
                 types = st.multiselect("Type magasin", refd["types"], st.session_state["flt_types"], key="form_types")
+
+            # Ligne 2 : RCR | Segmentation | Enseigne
+            row2_a, row2_b, row2_c = st.columns(3)
+            with row2_a:
+                rcr = st.multiselect("RCR", refd["rcr"], st.session_state["flt_rcr"], key="form_rcr")
+            with row2_b:
+                seg = st.multiselect("Segmentation", refd["seg"], st.session_state["flt_seg"], key="form_seg")
+            with row2_c:
+                enseignes = st.multiselect("Enseigne", refd["enseignes"], st.session_state["flt_enseignes"], key="form_enseignes")
 
             col_apply, col_reset = st.columns([2, 1])
             with col_apply:
@@ -377,6 +403,7 @@ def render_filters() -> dict:
                 st.session_state["flt_rcr"] = []
                 st.session_state["flt_reg_elargie"] = []
                 st.session_state["flt_reg_admin"] = []
+                st.session_state["flt_enseignes"] = []
                 st.session_state["filters_applied"] = False
 
             if apply:
@@ -401,6 +428,7 @@ def render_filters() -> dict:
                 st.session_state["flt_rcr"] = rcr
                 st.session_state["flt_seg"] = seg
                 st.session_state["flt_types"] = types
+                st.session_state["flt_enseignes"] = enseignes
 
                 st.session_state["filters_applied"] = True
 
@@ -425,6 +453,7 @@ def render_filters() -> dict:
         rcr=st.session_state["flt_rcr"],
         reg_elargie=st.session_state["flt_reg_elargie"],
         reg_admin=st.session_state["flt_reg_admin"],
+        enseignes=st.session_state["flt_enseignes"],
     )
 
     mags_cte_sql_B, mags_cte_params_B = build_mags_cte_sql(
@@ -438,10 +467,10 @@ def render_filters() -> dict:
         rcr=st.session_state["flt_rcr"],
         reg_elargie=st.session_state["flt_reg_elargie"],
         reg_admin=st.session_state["flt_reg_admin"],
+        enseignes=st.session_state["flt_enseignes"],
     )
 
-    # ✅ Compat rétro (évite KeyError dans pages existantes)
-    # -> mags_cte_sql / params = ceux de A
+    # ✅ Retour contexte
     return {
         "opA": {"code": code_opA, "lib": lib_opA, "date_debut": opA["date_debut"], "date_fin": opA["date_fin"]},
         "opB": {"code": code_opB, "lib": lib_opB, "date_debut": opB["date_debut"], "date_fin": opB["date_fin"]},
@@ -461,6 +490,7 @@ def render_filters() -> dict:
             "rcr": st.session_state["flt_rcr"],
             "reg_elargie": st.session_state["flt_reg_elargie"],
             "reg_admin": st.session_state["flt_reg_admin"],
+            "enseignes": st.session_state["flt_enseignes"],
         },
 
         # ✅ nouveaux (A/B)

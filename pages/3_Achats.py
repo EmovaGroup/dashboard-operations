@@ -676,7 +676,7 @@ else:
         )
     with r2c2:
         kpi_card_compare(
-            title="Nb magasins acheteurs",
+            title="Nb magasin en achats référencés",
             value_n=_f0(kA.get("nb_mag_acheteurs")),
             value_n1=_f0(kB.get("nb_mag_acheteurs")),
             label_n=lib_opA,
@@ -685,7 +685,7 @@ else:
         )
     with r2c3:
         kpi_card_compare(
-            title="% magasins acheteurs (sur parc)",
+            title="% magasin en achats référencés",
             value_n=_f0(kA.get("pct_mag_acheteurs")),
             value_n1=_f0(kB.get("pct_mag_acheteurs")),
             label_n=lib_opA,
