@@ -575,7 +575,7 @@ if code_magasin_selected:
 
     with c1:
         kpi_card_compare(
-            title="Valeur achats NET",
+            title="Valeur achats (TTC)",
             value_n=_f0(kA.get("valeur_achats_captee")),
             value_n1=_f0(kB.get("valeur_achats_captee")),
             label_n=lib_opA,
@@ -593,7 +593,7 @@ if code_magasin_selected:
         )
     with c3:
         kpi_card_compare(
-            title="PUM (Valeur NET / Quantité)",
+            title="PUM (Valeur TTC / Quantité)",
             value_n=_f0(kA.get("pum")),
             value_n1=_f0(kB.get("pum")),
             label_n=lib_opA,
@@ -604,7 +604,7 @@ if code_magasin_selected:
     st.divider()
 
     st.markdown("## 💶 Prix unitaire moyen (PUM) par fournisseur — magasin")
-    st.caption("PUM = **Somme(Valeur achats NET) / Somme(Quantités)** (pondéré).")
+    st.caption("PUM = **Somme(Valeur achats TTC) / Somme(Quantités)** (pondéré).")
 
     top_n = st.slider("Top N fournisseurs (table PUM par valeur N)", min_value=3, max_value=30, value=12, step=1)
 
@@ -623,13 +623,13 @@ if code_magasin_selected:
     display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
     display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
     display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
-    display_df["Valeur A (NET)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
-    display_df["Valeur B (NET)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
+    display_df["Valeur A (TTC)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
+    display_df["Valeur B (TTC)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
     display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
     display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
 
     st.dataframe(
-        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (NET)", "Valeur B (NET)", "Qte A", "Qte B"]],
+        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (TTC)", "Valeur B (TTC)", "Qte A", "Qte B"]],
         use_container_width=True,
         hide_index=True,
     )
@@ -647,7 +647,7 @@ else:
     r1c1, r1c2 = st.columns(2)
     with r1c1:
         kpi_card_compare(
-            title="Valeur achats (NET)",
+            title="Valeur achats (TTC)",
             value_n=_f0(kA.get("valeur_achats_captee")),
             value_n1=_f0(kB.get("valeur_achats_captee")),
             label_n=lib_opA,
@@ -719,7 +719,7 @@ else:
     st.divider()
 
     st.markdown("## 💶 Prix unitaire moyen (PUM) par fournisseur")
-    st.caption("PUM = **Somme(Valeur achats NET) / Somme(Quantités)** (pondéré).")
+    st.caption("PUM = **Somme(Valeur achats TTC) / Somme(Quantités)** (pondéré).")
 
     top_n = st.slider("Top N fournisseurs (table PUM par valeur A)", min_value=3, max_value=30, value=12, step=1)
 
@@ -738,13 +738,13 @@ else:
     display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
     display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
     display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
-    display_df["Valeur A (NET)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
-    display_df["Valeur B (NET)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
+    display_df["Valeur A (TTC)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
+    display_df["Valeur B (TTC)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
     display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
     display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
 
     st.dataframe(
-        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (NET)", "Valeur B (NET)", "Qte A", "Qte B"]],
+        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (TTC)", "Valeur B (TTC)", "Qte A", "Qte B"]],
         use_container_width=True,
         hide_index=True,
     )

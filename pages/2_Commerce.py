@@ -9,6 +9,23 @@
 # ✅ Ajouts demandés :
 # - KPI “Nb magasins sélectionnés” (sur le parc filtré)
 # - Export CSV tout en bas : toutes les données affichées (KPI + séries + poids + carte)
+#
+# ✅ Tulipe (2025 / 2026) :
+# - Branché sur tes MV :
+#   - public.mv_tulipe_2025_periode_op_magasin
+#   - public.mv_tulipe_2026_periode_op_magasin
+#   - public.mv_tulipe_2025_poids_op_periode_op_magasin
+#   - public.mv_tulipe_2026_poids_op_periode_op_magasin
+#
+# ✅ Modifs KPI demandées :
+# - Afficher les formules entre parenthèses
+# - Ajouter “Prix moyen article” = CA total / Nb articles vendus
+# - 3 lignes de 4 KPI
+# - “Nb magasins sélectionnés” tout à droite dans la 3ème ligne
+#
+# ✅ Ajout :
+# - Top 10 meilleurs magasins (perf) + Top 10 pires magasins (perf)
+#   (perf = variation CA % calculée comme sur la carte : (CA A - CA B) / CA B * 100)
 # -----------------------------------------------------------------------------
 
 import io
@@ -16,7 +33,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 import requests
 
 from src.auth import require_auth
@@ -35,6 +51,10 @@ OP_MV_PERIODE = {
     "noel_2024": "public.mv_noel_2024_periode_op_magasin",
     "anniversaire_2025": "public.mv_anniversaire_2025_periode_op_magasin",
     "anniversaire_2024": "public.mv_anniversaire_2024_periode_op_magasin",
+
+    # ✅ Tulipe
+    "tulipe_2026": "public.mv_tulipe_2026_periode_op_magasin",
+    "tulipe_2025": "public.mv_tulipe_2025_periode_op_magasin",
 }
 
 OP_MV_POIDS = {
@@ -43,6 +63,10 @@ OP_MV_POIDS = {
     "noel_2024": "public.mv_noel_2024_poids_op_periode_op_magasin",
     "anniversaire_2025": "public.mv_anniversaire_2025_poids_op_periode_op_magasin",
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
+
+    # ✅ Tulipe
+    "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
+    "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
 }
 
 
@@ -454,43 +478,59 @@ else:
 
 
 # =============================================================================
-# KPI — ligne 0 : Nb magasins sélectionnés
+# KPI — 3 lignes de 4 KPI (avec formules + prix moyen article)
 # =============================================================================
-r0 = st.columns(3)
-with r0[0]:
-    # même valeur A/B car même parc
-    kpi_card_compare("Nb magasins sélectionnés", nb_mag_selected, nb_mag_selected, lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
-with r0[1]:
-    kpi_card_compare("Poids OP valeur", poidsA["poids_ca"] * 100.0, poidsB["poids_ca"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
-with r0[2]:
-    kpi_card_compare("Poids OP volume", poidsA["poids_volume"] * 100.0, poidsB["poids_volume"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
+KPI_CA = "CA total"
+KPI_TICKETS = "Tickets total"
+KPI_ARTICLES = "Nb articles vendus"
+KPI_PANIER = "Panier moyen (CA total / Tickets total)"
 
-# =============================================================================
-# KPI — 1ère ligne (4) : CA | Tickets | Articles | Panier moyen
-# =============================================================================
+KPI_INDICE = "Indice de vente (Nb articles / Tickets total)"
+KPI_PRIX_ART = "Prix moyen article (CA total / Nb articles vendus)"
+KPI_CA_OP = "CA produits OP"
+KPI_TICKETS_OP = "Tickets produits OP"
+
+KPI_ARTICLES_OP = "Nb articles OP vendus"
+KPI_POIDS_CA = "Poids OP valeur (CA OP / CA total magasin)"
+KPI_POIDS_VOL = "Poids OP volume (Qte OP / Qte total magasin)"
+KPI_NB_MAG = "Nb magasins sélectionnés"
+
+# Prix moyen article = CA total / Nb articles vendus (calculé côté Python)
+pma_A = 0.0 if float(totA["articles_total"] or 0) == 0 else float(totA["ca_total"] or 0) / float(totA["articles_total"] or 1)
+pma_B = 0.0 if float(totB["articles_total"] or 0) == 0 else float(totB["ca_total"] or 0) / float(totB["articles_total"] or 1)
+
+# Ligne 1 (4)
 r1 = st.columns(4)
 with r1[0]:
-    kpi_card_compare("CA total", totA["ca_total"], totB["ca_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare(KPI_CA, totA["ca_total"], totB["ca_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
 with r1[1]:
-    kpi_card_compare("Tickets total", totA["tickets_total"], totB["tickets_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(KPI_TICKETS, totA["tickets_total"], totB["tickets_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 with r1[2]:
-    kpi_card_compare("Nb articles vendus", totA["articles_total"], totB["articles_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(KPI_ARTICLES, totA["articles_total"], totB["articles_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 with r1[3]:
-    kpi_card_compare("Panier moyen", totA["panier_moyen"], totB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+    kpi_card_compare(KPI_PANIER, totA["panier_moyen"], totB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
 
-# 2ème ligne (3) : OP
-r2 = st.columns(3)
+# Ligne 2 (4)
+r2 = st.columns(4)
 with r2[0]:
-    kpi_card_compare("CA produits OP", opA["ca_op_total"], opB["ca_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare(KPI_INDICE, totA["indice_vente"], totB["indice_vente"], lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f}")
 with r2[1]:
-    kpi_card_compare("Tickets produits OP", opA["tickets_op_total"], opB["tickets_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(KPI_PRIX_ART, pma_A, pma_B, lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
 with r2[2]:
-    kpi_card_compare("Nb articles OP vendus", opA["qte_op_total"], opB["qte_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(KPI_CA_OP, opA["ca_op_total"], opB["ca_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+with r2[3]:
+    kpi_card_compare(KPI_TICKETS_OP, opA["tickets_op_total"], opB["tickets_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 
-# 3ème ligne (1) : indice
-r3 = st.columns(1)
+# Ligne 3 (4) — Nb magasins sélectionnés tout à droite
+r3 = st.columns(4)
 with r3[0]:
-    kpi_card_compare("Indice de vente", totA["indice_vente"], totB["indice_vente"], lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f}")
+    kpi_card_compare(KPI_ARTICLES_OP, opA["qte_op_total"], opB["qte_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+with r3[1]:
+    kpi_card_compare(KPI_POIDS_CA, poidsA["poids_ca"] * 100.0, poidsB["poids_ca"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
+with r3[2]:
+    kpi_card_compare(KPI_POIDS_VOL, poidsA["poids_volume"] * 100.0, poidsB["poids_volume"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
+with r3[3]:
+    kpi_card_compare(KPI_NB_MAG, nb_mag_selected, nb_mag_selected, lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 
 st.divider()
 
@@ -568,6 +608,44 @@ except Exception as e:
 st.divider()
 
 # =============================================================================
+# TOP 10 magasins — meilleurs / pires perf (variation CA %)
+# =============================================================================
+st.subheader("🏪 Top magasins — meilleurs & pires perf (A vs B)")
+
+df_store_perf = (
+    dfA_store.rename(columns={"ca": "ca_A", "tickets": "tickets_A"})
+    .merge(dfB_store.rename(columns={"ca": "ca_B", "tickets": "tickets_B"}), on="code_magasin", how="outer")
+    .merge(df_mag, on="code_magasin", how="left")
+    .fillna(0)
+)
+
+df_store_perf["variation_CA_pct"] = np.where(
+    df_store_perf["ca_B"] > 0,
+    (df_store_perf["ca_A"] - df_store_perf["ca_B"]) / df_store_perf["ca_B"] * 100,
+    np.nan,
+)
+
+# Optionnel : arrondis pour lecture
+df_store_perf["ca_A"] = df_store_perf["ca_A"].astype(float)
+df_store_perf["ca_B"] = df_store_perf["ca_B"].astype(float)
+df_store_perf["variation_CA_pct"] = df_store_perf["variation_CA_pct"].astype(float)
+
+cols_show = ["code_magasin", "region_admin", "ca_A", "ca_B", "variation_CA_pct"]
+
+df_best = df_store_perf.dropna(subset=["variation_CA_pct"]).sort_values("variation_CA_pct", ascending=False).head(10)[cols_show]
+df_worst = df_store_perf.dropna(subset=["variation_CA_pct"]).sort_values("variation_CA_pct", ascending=True).head(10)[cols_show]
+
+c_top = st.columns(2)
+with c_top[0]:
+    st.markdown("### ✅ Top 10 meilleurs")
+    st.dataframe(df_best, use_container_width=True, hide_index=True)
+with c_top[1]:
+    st.markdown("### ❌ Top 10 pires")
+    st.dataframe(df_worst, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# =============================================================================
 # EXPORT CSV (tout ce qui est affiché)
 # =============================================================================
 st.markdown("## 📤 Export (CSV) — données affichées")
@@ -575,9 +653,6 @@ st.markdown("## 📤 Export (CSV) — données affichées")
 # 1) KPI export
 df_kpi_export = pd.DataFrame(
     [
-        {"bloc": "kpi", "kpi": "nb_mag_selected", "op": "A", "value": nb_mag_selected},
-        {"bloc": "kpi", "kpi": "nb_mag_selected", "op": "B", "value": nb_mag_selected},
-
         {"bloc": "kpi", "kpi": "ca_total", "op": "A", "value": totA["ca_total"]},
         {"bloc": "kpi", "kpi": "ca_total", "op": "B", "value": totB["ca_total"]},
         {"bloc": "kpi", "kpi": "tickets_total", "op": "A", "value": totA["tickets_total"]},
@@ -588,6 +663,8 @@ df_kpi_export = pd.DataFrame(
         {"bloc": "kpi", "kpi": "panier_moyen", "op": "B", "value": totB["panier_moyen"]},
         {"bloc": "kpi", "kpi": "indice_vente", "op": "A", "value": totA["indice_vente"]},
         {"bloc": "kpi", "kpi": "indice_vente", "op": "B", "value": totB["indice_vente"]},
+        {"bloc": "kpi", "kpi": "prix_moyen_article", "op": "A", "value": pma_A},
+        {"bloc": "kpi", "kpi": "prix_moyen_article", "op": "B", "value": pma_B},
 
         {"bloc": "kpi_op", "kpi": "ca_op_total", "op": "A", "value": opA["ca_op_total"]},
         {"bloc": "kpi_op", "kpi": "ca_op_total", "op": "B", "value": opB["ca_op_total"]},
@@ -600,6 +677,9 @@ df_kpi_export = pd.DataFrame(
         {"bloc": "poids", "kpi": "poids_ca", "op": "B", "value": poidsB["poids_ca"]},
         {"bloc": "poids", "kpi": "poids_volume", "op": "A", "value": poidsA["poids_volume"]},
         {"bloc": "poids", "kpi": "poids_volume", "op": "B", "value": poidsB["poids_volume"]},
+
+        {"bloc": "parc", "kpi": "nb_mag_selected", "op": "A", "value": nb_mag_selected},
+        {"bloc": "parc", "kpi": "nb_mag_selected", "op": "B", "value": nb_mag_selected},
     ]
 )
 
@@ -617,18 +697,11 @@ df_region_export = df_region.copy()
 df_region_export["opA"] = lib_opA
 df_region_export["opB"] = lib_opB
 
-# 4) Stores map export (magasin)
-df_store_export = (
-    dfA_store.rename(columns={"ca": "ca_A", "tickets": "tickets_A"})
-    .merge(dfB_store.rename(columns={"ca": "ca_B", "tickets": "tickets_B"}), on="code_magasin", how="outer")
-    .merge(df_mag, on="code_magasin", how="left")
-    .fillna(0)
-)
+# 4) Stores map export (magasin) + perf
+df_store_export = df_store_perf.copy()
 df_store_export["opA"] = lib_opA
 df_store_export["opB"] = lib_opB
 
-# Bundle (multi-csv via zip serait mieux, mais tu as demandé “csv” simple)
-# => on propose 4 downloads séparés (ultra clair)
 c_exp = st.columns(4)
 with c_exp[0]:
     st.download_button(
@@ -663,7 +736,6 @@ with c_exp[3]:
         use_container_width=True,
     )
 
-# Bonus : affichage tables (optionnel mais pratique)
 with st.expander("Voir les tables exportées"):
     st.markdown("### KPI")
     st.dataframe(df_kpi_export, use_container_width=True, hide_index=True)
@@ -671,5 +743,5 @@ with st.expander("Voir les tables exportées"):
     st.dataframe(df_series_export, use_container_width=True, hide_index=True)
     st.markdown("### Régions")
     st.dataframe(df_region_export, use_container_width=True, hide_index=True)
-    st.markdown("### Magasins")
+    st.markdown("### Magasins (avec perf)")
     st.dataframe(df_store_export, use_container_width=True, hide_index=True)
