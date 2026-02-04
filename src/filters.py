@@ -74,7 +74,7 @@ def load_ref_magasin_distincts() -> dict:
             order by reg_admin;
         """)["reg_admin"].tolist(),
 
-        # ✅ NEW — Enseigne
+        # ✅ Enseigne
         "enseignes": read_df("""
             select distinct enseigne
             from public.ref_magasin
@@ -103,15 +103,13 @@ def _init_state():
     ss.setdefault("flt_ermes_mode_B", "Tous")          # ori_ermes
     ss.setdefault("flt_fid_mode_B", "Tous")            # vw_ktb_with_sms_cost
 
-    # filtres parc "ref_magasin"
+    # filtres parc (attributs magasin)
     ss.setdefault("flt_code_magasin", None)
     ss.setdefault("flt_types", [])
     ss.setdefault("flt_seg", [])
     ss.setdefault("flt_rcr", [])
     ss.setdefault("flt_reg_elargie", [])
     ss.setdefault("flt_reg_admin", [])
-
-    # ✅ NEW — Enseigne
     ss.setdefault("flt_enseignes", [])
 
     ss.setdefault("filters_applied", False)
@@ -131,18 +129,25 @@ def build_mags_cte_sql(
     rcr: list[str],
     reg_elargie: list[str],
     reg_admin: list[str],
-    enseignes: list[str],  # ✅ NEW
+    enseignes: list[str],
 ) -> tuple[str, tuple]:
     """
     Construit le parc final "mags" en 3 étapes:
-      1) mags_parc : filtre ref_magasin
-      2) mags_base : filtre OP (op_magasin) selon parc_mode
-      3) mags      : filtre ensuite ERMES puis FID (même code_operation_ref)
+      0) periode_op : période (date_debut/date_fin) via ref_operations
+      1) mags_parc  : magasins qui ont AU MOINS 1 ticket sur la période de l'op
+                      (vw_silver_tickets_detaille_clean_op), puis filtres ref_magasin
+      2) mags_base  : filtre OP (op_magasin) selon parc_mode (Participants/Tous/Non participants)
+      3) mags       : filtre ensuite ERMES puis FID (même code_operation_ref)
 
-    Retour:
-      - SQL commençant par WITH ... et définissant mags
-      - params correspondant (dans l'ordre)
+    IMPORTANT :
+      - On se fiche du statut actif/ouverture : uniquement présence de tickets sur la période.
+      - Les filtres (type/seg/rcr/régions/enseigne) restent appliqués via ref_magasin.
     """
+
+    # --- filtres attributs (ref_magasin) ---
+    # NOTE: on met une clause qui marche même si rm est NULL (left join),
+    # donc on commence par exiger rm.code_magasin non null (comme ton code),
+    # et ça garantit que les filtres attributs ne gardent que les magasins connus du référentiel.
     where_parts = ["rm.code_magasin is not null"]
     params: list = []
 
@@ -165,22 +170,40 @@ def build_mags_cte_sql(
     if reg_admin:
         where_parts.append('rm."crp_:_region_nationale_d_affectation" = any(%s)')
         params.append(reg_admin)
-
-    # ✅ NEW — filtre enseigne
     if enseignes:
         where_parts.append("rm.enseigne = any(%s)")
         params.append(enseignes)
 
     where_sql = " AND ".join(where_parts)
 
-    mags_parc_cte = f"""
-mags_parc as (
-  select distinct trim(rm.code_magasin::text) as code_magasin
-  from public.ref_magasin rm
-  where {where_sql}
+    # --- période OP ---
+    periode_op_cte = """
+periode_op as (
+  select
+    min(date_debut) as date_debut,
+    max(date_fin)   as date_fin
+  from public.ref_operations
+  where code_operation = %s
 )
 """.strip()
 
+    # --- mags_parc = magasins avec au moins 1 ticket sur période ---
+    # (équivalent à ta requête : select distinct code_magasin from vw_silver_tickets_detaille_clean_op where ticket_date between ...)
+    mags_parc_cte = f"""
+mags_parc as (
+  select distinct trim(t.code_magasin::text) as code_magasin
+  from public.vw_silver_tickets_detaille_clean_op t
+  cross join periode_op p
+  left join public.ref_magasin rm
+    on trim(rm.code_magasin::text) = trim(t.code_magasin::text)
+  where t.code_magasin is not null
+    and t.ticket_date >= p.date_debut
+    and t.ticket_date <= p.date_fin
+    and {where_sql}
+)
+""".strip()
+
+    # --- participants OP ---
     mags_op_cte = """
 mags_op as (
   select distinct trim(code_magasin::text) as code_magasin
@@ -189,6 +212,8 @@ mags_op as (
 )
 """.strip()
 
+    # --- base selon parc_mode ---
+    # (on garde ton fallback actuel pour "Participants" si op_magasin est vide)
     if parc_mode == "Tous":
         mags_base_cte = """
 mags_base as (
@@ -197,6 +222,7 @@ mags_base as (
 """.strip()
         parc_params = []
         include_mags_op = False
+
     elif parc_mode == "Participants":
         mags_base_cte = """
 mags_base as (
@@ -213,7 +239,8 @@ mags_base as (
 """.strip()
         parc_params = [code_operation_ref]
         include_mags_op = True
-    else:
+
+    else:  # "Non participants"
         mags_base_cte = """
 mags_base as (
   select p.code_magasin
@@ -225,6 +252,7 @@ mags_base as (
         parc_params = [code_operation_ref]
         include_mags_op = True
 
+    # --- ERMES ---
     ermes_op_cte = """
 ermes_op as (
   select distinct trim(e.code_magasin::text) as code_magasin
@@ -245,6 +273,7 @@ mags_after_ermes as (
 )
 """.strip()
 
+    # --- FID ---
     fid_op_cte = """
 fid_op as (
   select distinct trim(k.code_magasin::text) as code_magasin
@@ -265,18 +294,24 @@ mags as (
 )
 """.strip()
 
-    ctes = []
+    ctes = [periode_op_cte]
     if include_mags_op:
         ctes.append(mags_op_cte)
     ctes += [mags_parc_cte, mags_base_cte, ermes_op_cte, ermes_filter_cte, fid_op_cte, fid_filter_cte]
 
     sql = "WITH " + ",\n".join(ctes)
 
-    final_params = []
+    # ordre des params = ordre des %s dans les CTE
+    final_params: list = []
+    final_params += [code_operation_ref]   # periode_op
+
     final_params += parc_params            # (optionnel) code_operation pour op_magasin
-    final_params += params                 # filtres ref_magasin (dont enseigne)
+
+    final_params += params                 # filtres ref_magasin (dans mags_parc)
+
     final_params += [code_operation_ref]   # ermes_op
     final_params += [ermes_mode, ermes_mode, ermes_mode]
+
     final_params += [code_operation_ref]   # fid_op
     final_params += [fid_mode, fid_mode, fid_mode]
 
@@ -360,7 +395,6 @@ def render_filters() -> dict:
                 key="form_magasin",
             )
 
-            # ✅ Mise en page demandée :
             # Ligne 1 : Région élargie | Région admin | Type magasin
             row1_a, row1_b, row1_c = st.columns(3)
             with row1_a:

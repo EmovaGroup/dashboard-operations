@@ -46,8 +46,9 @@ POIDS_MV_MAP = {
     "noel_2024": "public.mv_noel_2024_poids_op_periode_op_magasin",
     "anniversaire_2025": "public.mv_anniversaire_2025_poids_op_periode_op_magasin",
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
-    # 👉 Ajoute ici tulipe si tu as une MV poids
-    # "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
+    "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
+    "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
+    # 👉 Ajoute ici les futur mv_op_annee_poids_op_periode_op_magasin 
 }
 
 # =============================================================================

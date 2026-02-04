@@ -2,13 +2,12 @@
 # -----------------------------------------------------------------------------
 # COMMERCE — Dashboard (A vs B)
 #
-# ✅ Aligné avec la “même manip” que Global :
-# - UN SEUL parc filtré (ctx["mags_cte_sql"] / ctx["mags_cte_params"]) pour A et B
-# - KPI calculés sur vw_gold_tickets_jour_clean_op sur la période de l’opération
+# ✅ Aligné “Global-like” MAIS avec correction :
+# - ✅ Parc A et parc B séparés (mags_cte_sql_A / mags_cte_sql_B)
+#   => évite le bug “Nb magasins identique” (ex: Tulipe 2025 vs 2026)
 #
 # ✅ Ajouts demandés :
-# - KPI “Nb magasins sélectionnés” (sur le parc filtré)
-# - Export CSV tout en bas : toutes les données affichées (KPI + séries + poids + carte)
+# - Export CSV tout en bas : toutes les données affichées
 #
 # ✅ Tulipe (2025 / 2026) :
 # - Branché sur tes MV :
@@ -25,7 +24,7 @@
 #
 # ✅ Ajout :
 # - Top 10 meilleurs magasins (perf) + Top 10 pires magasins (perf)
-#   (perf = variation CA % calculée comme sur la carte : (CA A - CA B) / CA B * 100)
+#   (perf = variation CA % : (CA A - CA B) / CA B * 100)
 # -----------------------------------------------------------------------------
 
 import io
@@ -204,7 +203,7 @@ def _plot_poids_bar(poidsA: dict, poidsB: dict, label_A: str, label_B: str):
 
 
 # =============================================================================
-# LOADERS (même logique Global : 1 parc filtré)
+# LOADERS (parc A/B)
 # =============================================================================
 @st.cache_data(ttl=600)
 def count_selected_mags(mags_cte_sql_: str, mags_cte_params_: tuple) -> int:
@@ -430,36 +429,39 @@ lib_opB = ctx["opB"]["lib"]
 dateB0 = str(ctx["opB"]["date_debut"])
 dateB1 = str(ctx["opB"]["date_fin"])
 
-# ✅ MÊME MANIP GLOBAL : UN SEUL parc filtré pour A et B
-mags_cte_sql = ctx["mags_cte_sql"]
-mags_cte_params = ctx["mags_cte_params"]
+# ✅ CORRECTION : parc A et parc B séparés
+mags_cte_sql_A = ctx["mags_cte_sql_A"]
+mags_cte_params_A = ctx["mags_cte_params_A"]
+mags_cte_sql_B = ctx["mags_cte_sql_B"]
+mags_cte_params_B = ctx["mags_cte_params_B"]
 
 mvA_periode = OP_MV_PERIODE.get(code_opA)
 mvB_periode = OP_MV_PERIODE.get(code_opB)
 mvA_poids = OP_MV_POIDS.get(code_opA)
 mvB_poids = OP_MV_POIDS.get(code_opB)
 
-# ✅ nb magasins sélectionnés (parc filtré)
-nb_mag_selected = count_selected_mags(mags_cte_sql, mags_cte_params)
+# ✅ nb magasins sélectionnés (parc A vs parc B)
+nb_mag_selected_A = count_selected_mags(mags_cte_sql_A, mags_cte_params_A)
+nb_mag_selected_B = count_selected_mags(mags_cte_sql_B, mags_cte_params_B)
 
 st.markdown("## 🛒 Commerce — KPI (A vs B)")
-st.caption(f"Magasins sélectionnés (parc filtré) : **{nb_mag_selected}**")
+st.caption(f"Magasins sélectionnés (parc) : **{nb_mag_selected_A}** vs **{nb_mag_selected_B}**")
 st.divider()
 
-# ✅ totaux calculés sur le même parc (Global-like)
-totA = load_totaux_commerce(mags_cte_sql, mags_cte_params, dateA0, dateA1)
-totB = load_totaux_commerce(mags_cte_sql, mags_cte_params, dateB0, dateB1)
+# ✅ totaux A / B (chacun sur son parc)
+totA = load_totaux_commerce(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
+totB = load_totaux_commerce(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
 
 opA = {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
 opB = {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
 
 if mvA_periode:
-    opA = load_op_totaux_depuis_mv_periode(mags_cte_sql, mags_cte_params, mvA_periode)
+    opA = load_op_totaux_depuis_mv_periode(mags_cte_sql_A, mags_cte_params_A, mvA_periode)
 else:
     st.warning(f"MV période OP manquante pour {code_opA}. Ajoute-la dans OP_MV_PERIODE.")
 
 if mvB_periode:
-    opB = load_op_totaux_depuis_mv_periode(mags_cte_sql, mags_cte_params, mvB_periode)
+    opB = load_op_totaux_depuis_mv_periode(mags_cte_sql_B, mags_cte_params_B, mvB_periode)
 else:
     st.warning(f"MV période OP manquante pour {code_opB}. Ajoute-la dans OP_MV_PERIODE.")
 
@@ -467,12 +469,12 @@ poidsA = {"poids_ca": 0.0, "poids_volume": 0.0}
 poidsB = {"poids_ca": 0.0, "poids_volume": 0.0}
 
 if mvA_poids:
-    poidsA = load_poids_op_global_depuis_mv_poids(mags_cte_sql, mags_cte_params, mvA_poids)
+    poidsA = load_poids_op_global_depuis_mv_poids(mags_cte_sql_A, mags_cte_params_A, mvA_poids)
 else:
     st.warning(f"MV poids OP manquante pour {code_opA}. Ajoute-la dans OP_MV_POIDS.")
 
 if mvB_poids:
-    poidsB = load_poids_op_global_depuis_mv_poids(mags_cte_sql, mags_cte_params, mvB_poids)
+    poidsB = load_poids_op_global_depuis_mv_poids(mags_cte_sql_B, mags_cte_params_B, mvB_poids)
 else:
     st.warning(f"MV poids OP manquante pour {code_opB}. Ajoute-la dans OP_MV_POIDS.")
 
@@ -495,7 +497,7 @@ KPI_POIDS_CA = "Poids OP valeur (CA OP / CA total magasin)"
 KPI_POIDS_VOL = "Poids OP volume (Qte OP / Qte total magasin)"
 KPI_NB_MAG = "Nb magasins sélectionnés"
 
-# Prix moyen article = CA total / Nb articles vendus (calculé côté Python)
+# Prix moyen article = CA total / Nb articles vendus
 pma_A = 0.0 if float(totA["articles_total"] or 0) == 0 else float(totA["ca_total"] or 0) / float(totA["articles_total"] or 1)
 pma_B = 0.0 if float(totB["articles_total"] or 0) == 0 else float(totB["ca_total"] or 0) / float(totB["articles_total"] or 1)
 
@@ -530,17 +532,17 @@ with r3[1]:
 with r3[2]:
     kpi_card_compare(KPI_POIDS_VOL, poidsA["poids_volume"] * 100.0, poidsB["poids_volume"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
 with r3[3]:
-    kpi_card_compare(KPI_NB_MAG, nb_mag_selected, nb_mag_selected, lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(KPI_NB_MAG, nb_mag_selected_A, nb_mag_selected_B, lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 
 st.divider()
 
 # =============================================================================
-# COURBES — SUPERPOSITION JOUR 1..N (même parc)
+# COURBES — SUPERPOSITION JOUR 1..N (parc A vs parc B)
 # =============================================================================
 st.markdown("## 📈 Évolution jour — superposition (Jour 1..N)")
 
-sA = load_series_jour_relative(mags_cte_sql, mags_cte_params, dateA0, dateA1)
-sB = load_series_jour_relative(mags_cte_sql, mags_cte_params, dateB0, dateB1)
+sA = load_series_jour_relative(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
+sB = load_series_jour_relative(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
 
 _superposed_line_by_dayindex(sA, sB, "ca_ttc_net", "CA TTC net / jour — superposition A vs B", "CA (€)", lib_opA, lib_opB)
 _superposed_line_by_dayindex(sA, sB, "nb_tickets", "Tickets / jour — superposition A vs B", "Tickets", lib_opA, lib_opB)
@@ -559,13 +561,17 @@ _plot_poids_bar(poidsA, poidsB, lib_opA, lib_opB)
 st.divider()
 
 # =============================================================================
-# CARTE FRANCE PAR RÉGION ADMIN (A vs B) — variation CA (même parc)
+# CARTE FRANCE PAR RÉGION ADMIN (A vs B) — variation CA (parc A/B)
 # =============================================================================
 st.subheader("🗺️ Carte des performances régionales – variation CA (A vs B)")
 
-dfA_store = load_store_totals_for_map(mags_cte_sql, mags_cte_params, dateA0, dateA1)
-dfB_store = load_store_totals_for_map(mags_cte_sql, mags_cte_params, dateB0, dateB1)
-df_mag = load_mag_regions(mags_cte_sql, mags_cte_params)
+dfA_store = load_store_totals_for_map(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
+dfB_store = load_store_totals_for_map(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
+
+# régions : on prend l’union des 2 parcs pour avoir le mapping région pour tous les codes
+df_mag_A = load_mag_regions(mags_cte_sql_A, mags_cte_params_A)
+df_mag_B = load_mag_regions(mags_cte_sql_B, mags_cte_params_B)
+df_mag = pd.concat([df_mag_A, df_mag_B], ignore_index=True).drop_duplicates(subset=["code_magasin"])
 
 df_region_A = (
     dfA_store.merge(df_mag[["code_magasin", "region_admin"]], on="code_magasin", how="left")
@@ -625,7 +631,6 @@ df_store_perf["variation_CA_pct"] = np.where(
     np.nan,
 )
 
-# Optionnel : arrondis pour lecture
 df_store_perf["ca_A"] = df_store_perf["ca_A"].astype(float)
 df_store_perf["ca_B"] = df_store_perf["ca_B"].astype(float)
 df_store_perf["variation_CA_pct"] = df_store_perf["variation_CA_pct"].astype(float)
@@ -650,7 +655,6 @@ st.divider()
 # =============================================================================
 st.markdown("## 📤 Export (CSV) — données affichées")
 
-# 1) KPI export
 df_kpi_export = pd.DataFrame(
     [
         {"bloc": "kpi", "kpi": "ca_total", "op": "A", "value": totA["ca_total"]},
@@ -678,12 +682,11 @@ df_kpi_export = pd.DataFrame(
         {"bloc": "poids", "kpi": "poids_volume", "op": "A", "value": poidsA["poids_volume"]},
         {"bloc": "poids", "kpi": "poids_volume", "op": "B", "value": poidsB["poids_volume"]},
 
-        {"bloc": "parc", "kpi": "nb_mag_selected", "op": "A", "value": nb_mag_selected},
-        {"bloc": "parc", "kpi": "nb_mag_selected", "op": "B", "value": nb_mag_selected},
+        {"bloc": "parc", "kpi": "nb_mag_selected", "op": "A", "value": nb_mag_selected_A},
+        {"bloc": "parc", "kpi": "nb_mag_selected", "op": "B", "value": nb_mag_selected_B},
     ]
 )
 
-# 2) Séries export (jour)
 df_series_export = pd.concat(
     [
         sA.assign(operation=lib_opA),
@@ -692,12 +695,10 @@ df_series_export = pd.concat(
     ignore_index=True,
 )
 
-# 3) Carte export (région)
 df_region_export = df_region.copy()
 df_region_export["opA"] = lib_opA
 df_region_export["opB"] = lib_opB
 
-# 4) Stores map export (magasin) + perf
 df_store_export = df_store_perf.copy()
 df_store_export["opA"] = lib_opA
 df_store_export["opB"] = lib_opB

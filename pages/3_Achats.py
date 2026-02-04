@@ -1,6 +1,6 @@
 # pages/3_Achats.py
 # =============================================================================
-# PAGE : ACHATS (A vs B) — avec parcs séparés A/B (fix filtres)
+# PAGE : ACHATS (A vs B) — parcs séparés A/B + normalisation ancien_code -> code_magasin
 # =============================================================================
 # Objectif :
 # - Comparer 2 opérations (A vs B) sur les achats
@@ -9,9 +9,19 @@
 #   2) Mode parc : sinon -> KPI parc + camemberts + table PUM
 #
 # Fix majeur filtres :
-# ✅ On utilise maintenant 2 parcs distincts :
+# ✅ 2 parcs distincts :
 #    - mags_cte_sql_A / mags_cte_params_A  (parc pour l'opération A)
 #    - mags_cte_sql_B / mags_cte_params_B  (parc pour l'opération B)
+#
+# Fix majeur achats :
+# ✅ Normalisation du code magasin achats via vw_param_magasin_ancien_code :
+#    - code_magasin_canon = COALESCE(map.code_magasin, UPPER(TRIM(a.code_magasin)))
+#    => permet d’aligner N vs N-1 si le code a changé
+#
+# Parc Achats souhaité :
+# ✅ Base parc = mags (tickets période op depuis filters.py)
+# ✅ + ajouter les magasins qui ont acheté sur l’op (vw_op_achats_norm), même sans tickets
+# ✅ mais uniquement si le code canonique existe dans ref_magasin
 #
 # Bonus demandé “comme Marketing” :
 # ✅ Ajout au-dessus des KPI achats : CA total, Tickets total, Panier moyen (sur la période de l'op)
@@ -80,6 +90,11 @@ st.caption(f"Opération A : **{lib_opA}**  |  Opération B : **{lib_opB}**")
 # -----------------------------------------------------------------------------
 ACHATS_SRC = "public.vw_op_achats_norm"  # contient fournisseur_norm
 
+# -----------------------------------------------------------------------------
+# Mapping ancien code -> nouveau code (canon)
+# -----------------------------------------------------------------------------
+CODE_MAP_VIEW = "public.vw_param_magasin_ancien_code"
+
 
 # =============================================================================
 # Helpers Python (safe casts)
@@ -97,18 +112,18 @@ def _f0(x) -> float:
 # Palette couleurs (UX-friendly)
 # =============================================================================
 BASE_PALETTE = [
-    "#4E79A7",  # bleu
-    "#59A14F",  # vert
-    "#F28E2B",  # orange
-    "#E15759",  # rouge doux
-    "#B07AA1",  # violet
-    "#76B7B2",  # turquoise
-    "#EDC948",  # jaune doux
-    "#FF9DA7",  # rose clair
-    "#9C755F",  # brun
-    "#BAB0AC",  # gris
+    "#4E79A7",
+    "#59A14F",
+    "#F28E2B",
+    "#E15759",
+    "#B07AA1",
+    "#76B7B2",
+    "#EDC948",
+    "#FF9DA7",
+    "#9C755F",
+    "#BAB0AC",
 ]
-COLOR_AUTRES_NON_CAPTES = "#6B7280"  # gris neutre
+COLOR_AUTRES_NON_CAPTES = "#6B7280"
 
 
 def build_color_map(labels: list[str]) -> dict:
@@ -211,7 +226,7 @@ def render_magasin_fiche(code_magasin: str):
     badges = []
     statut = (info.get("statut") or "").strip()
     if statut:
-        cls = "badge-ok" if statut.lower() in ("actif", "ouverture") else "badge-warn"
+        cls = "badge-ok" if "actif" in statut.lower() or "ouvert" in statut.lower() else "badge-warn"
         badges.append((statut, cls))
 
     col_left = [
@@ -254,15 +269,42 @@ def render_magasin_fiche(code_magasin: str):
 
 
 # =============================================================================
-# HELPERS SQL PARC (fix : prend le mags_cte_* en paramètre)
+# Helper SQL — normalisation code magasin achats (canon)
+# =============================================================================
+def _achats_norm_cte(code_op: str) -> tuple[str, list]:
+    """
+    Normalise a.code_magasin en code canonique :
+    - si a.code_magasin = ancien_code => remap vers code_magasin (nouveau)
+    - sinon => code_magasin lui-même (upper/trim)
+    """
+    cte = f"""
+a_norm as (
+  select
+    coalesce(vp.code_magasin, upper(trim(a.code_magasin::text))) as code_magasin_canon,
+    a.*
+  from {ACHATS_SRC} a
+  left join {CODE_MAP_VIEW} vp
+    on upper(trim(a.code_magasin::text)) = vp.ancien_code
+  where a.code_operation = %s
+    and a.code_magasin is not null
+)
+""".strip()
+    return cte, [code_op]
+
+
+# =============================================================================
+# HELPERS SQL PARC
 # =============================================================================
 def _parc_analysis_cte(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> tuple[str, tuple]:
     """
-    Parc d'analyse :
-    - Base = mags (déjà filtré par filters.py)
-    - Actif / Ouverture
-    - On garde aussi les acheteurs OP, mais uniquement si le magasin est déjà dans mags_dist
+    Parc d'analyse Achats :
+    - Base = mags (tickets période op) déjà filtré par filters.py
+    - + ajouter les acheteurs OP (même si achats existent sans tickets)
+    - ✅ achats remappés via code_magasin_canon (ancien_code -> nouveau)
+    - ✅ on garde uniquement les codes canoniques présents dans ref_magasin
     """
+    achats_cte, achats_params = _achats_norm_cte(code_op)
+
     sql = f"""
 {mags_cte_sql_},
 
@@ -272,41 +314,39 @@ mags_dist as (
   where code_magasin is not null
 ),
 
-mags_actifs as (
-  select md.code_magasin
-  from mags_dist md
-  join public.ref_magasin rm
-    on trim(rm.code_magasin::text) = md.code_magasin
-  where rm.statut in ('Actif','Ouverture')
-),
+{achats_cte},
 
 mags_acheteurs_op as (
-  select distinct trim(a.code_magasin::text) as code_magasin
-  from {ACHATS_SRC} a
-  join mags_dist md
-    on md.code_magasin = trim(a.code_magasin::text)
-  where a.code_operation = %s
-    and a.code_magasin is not null
+  select distinct a.code_magasin_canon as code_magasin
+  from a_norm a
+  join public.ref_magasin rm
+    on trim(rm.code_magasin::text) = a.code_magasin_canon
 ),
 
 parc_analysis as (
-  select code_magasin from mags_actifs
+  select code_magasin from mags_dist
   union
   select code_magasin from mags_acheteurs_op
 )
 """
-    return sql, tuple(list(mags_cte_params_) + [code_op])
+    # params: mags_cte_params_ + achats_params
+    return sql, tuple(list(mags_cte_params_) + achats_params)
 
 
 # =============================================================================
 # Check data (message clair si rien)
 # =============================================================================
 def has_data_for_magasin(code_op: str, code_magasin: str) -> bool:
+    """
+    Vérifie si le magasin a au moins une ligne d'achat sur l'op
+    en tenant compte du remap ancien_code -> nouveau code (canon).
+    """
     sql = f"""
+with
+{_achats_norm_cte(code_op)[0]}
 select 1
-from {ACHATS_SRC} a
-where a.code_operation = %s
-  and trim(a.code_magasin::text) = %s
+from a_norm a
+where a.code_magasin_canon = upper(trim(%s::text))
 limit 1;
 """
     df = read_df(sql, params=(code_op, code_magasin))
@@ -318,12 +358,10 @@ def has_data_for_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str)
     sql = f"""
 {parc_sql}
 select 1
-from {ACHATS_SRC} a
-join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-where a.code_operation = %s
+from parc_analysis p
 limit 1;
 """
-    df = read_df(sql, params=tuple(list(parc_params) + [code_op]))
+    df = read_df(sql, params=parc_params)
     return not df.empty
 
 
@@ -341,13 +379,14 @@ def no_data_block(msg: str):
 # =============================================================================
 def achats_kpi_magasin(code_op: str, code_magasin: str) -> pd.Series:
     sql = f"""
+with
+{_achats_norm_cte(code_op)[0]}
 select
   coalesce(sum(a."total achat"),0) as valeur_achats_captee,
   coalesce(sum(a.quantite),0) as volume_achats_capte,
   coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
-from {ACHATS_SRC} a
-where a.code_operation = %s
-  and trim(a.code_magasin::text) = %s;
+from a_norm a
+where a.code_magasin_canon = upper(trim(%s::text));
 """
     df = read_df(sql, params=(code_op, code_magasin))
     if df.empty:
@@ -357,14 +396,15 @@ where a.code_operation = %s
 
 def pum_par_fournisseur_magasin(code_op: str, code_magasin: str) -> pd.DataFrame:
     sql = f"""
+with
+{_achats_norm_cte(code_op)[0]}
 select
   coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
   coalesce(sum(a.quantite),0) as qte,
   coalesce(sum(a."total achat"),0) as valeur,
   coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
-from {ACHATS_SRC} a
-where a.code_operation = %s
-  and trim(a.code_magasin::text) = %s
+from a_norm a
+where a.code_magasin_canon = upper(trim(%s::text))
 group by 1
 order by valeur desc;
 """
@@ -372,21 +412,22 @@ order by valeur desc;
 
 
 # =============================================================================
-# MODE PARC : KPI + camemberts + table PUM (fix : parc A/B séparés)
+# MODE PARC : KPI + camemberts + table PUM
 # =============================================================================
 def achats_kpi_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.Series:
     parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+
     sql = f"""
 {parc_sql},
 
+-- achats captés par magasin (sur code canonique)
 achats_capt as (
   select
-    trim(a.code_magasin::text) as code_magasin,
+    a.code_magasin_canon as code_magasin,
     coalesce(sum(a."total achat"),0) as valeur_achats,
     coalesce(sum(a.quantite),0) as volume_achats
-  from {ACHATS_SRC} a
-  join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-  where a.code_operation = %s
+  from a_norm a
+  join parc_analysis p on p.code_magasin = a.code_magasin_canon
   group by 1
 ),
 
@@ -401,7 +442,6 @@ agg as (
     (select nb_mag_acheteurs from acheteurs) as nb_mag_acheteurs
   from achats_capt ac
 )
-
 select
   coalesce(valeur_achats_captee,0) as valeur_achats_captee,
   coalesce(volume_achats_capte,0)  as volume_achats_capte,
@@ -410,7 +450,7 @@ select
   coalesce(round(nb_mag_acheteurs::numeric / nullif(nb_mag_parc,0) * 100, 1), 0) as pct_mag_acheteurs
 from agg;
 """
-    df = read_df(sql, params=tuple(list(parc_params) + [code_op]))
+    df = read_df(sql, params=parc_params)
     if df.empty:
         return pd.Series(
             {
@@ -424,19 +464,24 @@ from agg;
     return df.iloc[0]
 
 
-def camembert_fusion_magasin_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str, top_n_fournisseurs: int = 12) -> pd.DataFrame:
+def camembert_fusion_magasin_parc(
+    mags_cte_sql_: str,
+    mags_cte_params_: tuple,
+    code_op: str,
+    top_n_fournisseurs: int = 12
+) -> pd.DataFrame:
     parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+
     sql = f"""
 {parc_sql},
 
 achats_mag_fourn as (
   select
-    trim(a.code_magasin::text) as code_magasin,
+    a.code_magasin_canon as code_magasin,
     coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
     coalesce(sum(a."total achat"),0) as valeur
-  from {ACHATS_SRC} a
-  join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-  where a.code_operation = %s
+  from a_norm a
+  join parc_analysis p on p.code_magasin = a.code_magasin_canon
   group by 1,2
 ),
 
@@ -491,11 +536,12 @@ select fournisseur, nb_mag from capt_rest where nb_mag > 0
 union all
 select fournisseur, nb_mag from autres_non_captes;
 """
-    return read_df(sql, params=tuple(list(parc_params) + [code_op]))
+    return read_df(sql, params=parc_params)
 
 
 def pum_par_fournisseur_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.DataFrame:
     parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+
     sql = f"""
 {parc_sql}
 select
@@ -503,13 +549,12 @@ select
   coalesce(sum(a.quantite),0) as qte,
   coalesce(sum(a."total achat"),0) as valeur,
   coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
-from {ACHATS_SRC} a
-join parc_analysis p on p.code_magasin = trim(a.code_magasin::text)
-where a.code_operation = %s
+from a_norm a
+join parc_analysis p on p.code_magasin = a.code_magasin_canon
 group by 1
 order by valeur desc;
 """
-    return read_df(sql, params=tuple(list(parc_params) + [code_op]))
+    return read_df(sql, params=parc_params)
 
 
 def render_pie_with_shared_palette(df: pd.DataFrame, all_labels: list[str], color_map: dict):
@@ -561,7 +606,7 @@ st.divider()
 if code_magasin_selected:
     # --- check data magasin (sur OP A) ---
     if not has_data_for_magasin(code_opA, code_magasin_selected):
-        no_data_block(f"Magasin **{code_magasin_selected}** : aucune ligne d’achat sur **{lib_opA}**.")
+        no_data_block(f"Magasin **{code_magasin_selected}** : aucune ligne d’achat (remap inclus) sur **{lib_opA}**.")
 
     st.markdown("## 🏬 Magasin sélectionné")
     render_magasin_fiche(code_magasin_selected)
@@ -635,9 +680,9 @@ if code_magasin_selected:
     )
 
 else:
-    # --- check data parc (sur OP A, parc A) ---
+    # --- check parc (sur OP A, parc A) ---
     if not has_data_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA):
-        no_data_block(f"Aucune ligne d’achat sur **{lib_opA}** avec les filtres actuels.")
+        no_data_block("Aucun magasin dans le parc (tickets + acheteurs remap) avec les filtres actuels.")
 
     kA = achats_kpi_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
     kB = achats_kpi_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)

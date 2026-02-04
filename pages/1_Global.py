@@ -2,13 +2,14 @@
 # -----------------------------------------------------------------------------
 # GLOBAL — Dashboard (A vs B)
 #
-# ✅ Objectif : revenir EXACTEMENT à ta logique de calcul CA “comme avant”
-# - On utilise UN SEUL parc filtré : ctx["mags_cte_sql"] + ctx["mags_cte_params"]
-# - On calcule le CA via vw_gold_tickets_jour_clean_op sur la période de l’opération
-# - On supprime le KeyError sur ctx["parc_mode"] (clé plus présente)
+# ✅ Logique corrigée :
+# - Parc A = ctx["mags_cte_sql_A"] + params_A
+# - Parc B = ctx["mags_cte_sql_B"] + params_B
+# - KPI calculés sur vw_gold_tickets_jour_clean_op sur la période de l’opération (vw_operations_dedup)
 #
-# ⚠️ Important :
-# - Ici, A et B utilisent le même parc (même filtre magasin), comme ton ancien code.
+# ✅ Fix IMPORTANT :
+# - Mode magasin : KPI calculés UNIQUEMENT sur ce magasin
+# - Mode parc : KPI A sur parc A, KPI B sur parc B (avant : bug => B compté sur parc A)
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -41,7 +42,7 @@ inject_kpi_compare_css()
 inject_store_css()
 
 # =========================
-# Filtres globaux
+# Filtres
 # =========================
 ctx = render_filters()
 
@@ -50,15 +51,14 @@ lib_opA = ctx["opA"]["lib"]
 code_opB = ctx["opB"]["code"]
 lib_opB = ctx["opB"]["lib"]
 
-mags_cte_sql = ctx["mags_cte_sql"]        # ✅ commence par WITH
-mags_cte_params = ctx["mags_cte_params"]  # ✅ params correspondants
+# ✅ FIX : parcs séparés A/B
+mags_cte_sql_A = ctx["mags_cte_sql_A"]
+mags_cte_params_A = ctx["mags_cte_params_A"]
+mags_cte_sql_B = ctx["mags_cte_sql_B"]
+mags_cte_params_B = ctx["mags_cte_params_B"]
 
 filters = ctx.get("filters", {})
 code_magasin_selected = filters.get("code_magasin")
-
-# ✅ FIX KeyError : la clé n’existe plus dans ton ctx
-# (si tu en as besoin un jour : parc_mode = ctx.get("parc_mode", True))
-parc_mode = ctx.get("parc_mode", True)
 
 st.caption(
     f"Année N : **{lib_opA}** ({ctx['opA']['date_debut']} → {ctx['opA']['date_fin']})  |  "
@@ -99,6 +99,18 @@ def sel_or_null(col: str | None, alias: str, existing_cols: set[str]) -> str:
 
 
 # =========================
+# CTE mags override pour MODE MAGASIN
+# =========================
+def mags_cte_for_store(code_magasin: str) -> tuple[str, tuple]:
+    sql = """
+WITH mags as (
+  select trim(%s::text) as code_magasin
+)
+""".strip()
+    return sql, (code_magasin,)
+
+
+# =========================
 # Scopes (Tous / Paris / IDF / Province)
 # =========================
 def _scope_clause_and_params(scope: str):
@@ -126,13 +138,13 @@ def _scope_clause_and_params(scope: str):
 
 
 # =========================
-# KPI query (agrégé période) — EXACTEMENT comme avant
+# KPI query (agrégé période) — vw_operations_dedup
 # =========================
-def kpi_query(code_op: str, scope: str) -> pd.DataFrame:
+def kpi_query(code_op: str, scope: str, mags_sql: str, mags_params: tuple) -> pd.DataFrame:
     scope_sql, scope_params = _scope_clause_and_params(scope)
 
     sql = f"""
-{mags_cte_sql},
+{mags_sql},
 op as (
   select date_debut, date_fin
   from public.vw_operations_dedup
@@ -155,7 +167,7 @@ left join public.ref_magasin rm
   on trim(rm.code_magasin::text) = trim(st.code_magasin::text)
 where {scope_sql};
 """
-    params = (*mags_cte_params, code_op, *scope_params)
+    params = (*mags_params, code_op, *scope_params)
     df = read_df(sql, params=params)
     if df.empty:
         return pd.DataFrame([{
@@ -165,11 +177,11 @@ where {scope_sql};
     return df
 
 
-def count_magasin_query(code_op: str, scope: str) -> int:
+def count_magasin_query(code_op: str, scope: str, mags_sql: str, mags_params: tuple) -> int:
     scope_sql, scope_params = _scope_clause_and_params(scope)
 
     sql = f"""
-{mags_cte_sql},
+{mags_sql},
 op as (
   select date_debut, date_fin
   from public.vw_operations_dedup
@@ -183,17 +195,17 @@ join op on st.ticket_date between op.date_debut and op.date_fin
 left join public.ref_magasin rm on trim(rm.code_magasin::text) = trim(st.code_magasin::text)
 where {scope_sql};
 """
-    params = (*mags_cte_params, code_op, *scope_params)
+    params = (*mags_params, code_op, *scope_params)
     df = read_df(sql, params=params)
     return int(df["nb_magasin"].iloc[0] or 0) if not df.empty else 0
 
 
 # =========================
-# DAILY SERIES (Jour 1..N) => superposition
+# DAILY SERIES (Jour 1..N)
 # =========================
-def daily_kpis_query(code_op: str) -> pd.DataFrame:
+def daily_kpis_query(code_op: str, mags_sql: str, mags_params: tuple) -> pd.DataFrame:
     sql = f"""
-{mags_cte_sql},
+{mags_sql},
 op as (
   select date_debut, date_fin
   from public.vw_operations_dedup
@@ -214,7 +226,7 @@ join op on st.ticket_date between op.date_debut and op.date_fin
 group by (st.ticket_date - op.date_debut + 1)
 order by day_idx;
 """
-    df = read_df(sql, params=(*mags_cte_params, code_op))
+    df = read_df(sql, params=(*mags_params, code_op))
     if df.empty:
         return df
     df["day_idx"] = df["day_idx"].astype(int)
@@ -268,9 +280,9 @@ limit 1;
     return read_df(sql, params=(code_magasin,))
 
 
-def meteo_filename_for_op(code_op: str) -> str | None:
+def meteo_filename_for_op(code_op: str, mags_sql: str, mags_params: tuple) -> str | None:
     sql = f"""
-{mags_cte_sql},
+{mags_sql},
 op as (
   select date_debut, date_fin
   from public.vw_operations_dedup
@@ -286,7 +298,7 @@ group by st.asset_file_meteo
 order by count(*) desc
 limit 1;
 """
-    df = read_df(sql, params=(*mags_cte_params, code_op))
+    df = read_df(sql, params=(*mags_params, code_op))
     if df.empty:
         return None
     return df.iloc[0]["asset_file_meteo"]
@@ -367,9 +379,11 @@ def render_magasin_fiche(code_magasin: str):
         right_title="Infos magasin",
     )
 
+    store_mags_sql, store_mags_params = mags_cte_for_store(code_magasin)
+
     st.markdown("### 🌤️ Météo (icônes) — magasin")
-    fileA = meteo_filename_for_op(code_opA)
-    fileB = meteo_filename_for_op(code_opB)
+    fileA = meteo_filename_for_op(code_opA, store_mags_sql, store_mags_params)
+    fileB = meteo_filename_for_op(code_opB, store_mags_sql, store_mags_params)
 
     m1, m2 = st.columns(2)
     with m1:
@@ -381,8 +395,8 @@ def render_magasin_fiche(code_magasin: str):
 
     st.divider()
 
-    rA = kpi_query(code_opA, "ALL").iloc[0]
-    rB = kpi_query(code_opB, "ALL").iloc[0]
+    rA = kpi_query(code_opA, "ALL", store_mags_sql, store_mags_params).iloc[0]
+    rB = kpi_query(code_opB, "ALL", store_mags_sql, store_mags_params).iloc[0]
 
     st.markdown("### 📌 Performance (N vs N-1)")
     c1, c2, c3 = st.columns(3)
@@ -405,8 +419,8 @@ def render_magasin_fiche(code_magasin: str):
 
     st.markdown("### 📈 Évolution jour par jour (Jour 1 → Jour N) — superposition N vs N-1")
 
-    dfA = daily_kpis_query(code_opA)
-    dfB = daily_kpis_query(code_opB)
+    dfA = daily_kpis_query(code_opA, store_mags_sql, store_mags_params)
+    dfB = daily_kpis_query(code_opB, store_mags_sql, store_mags_params)
 
     if dfA.empty and dfB.empty:
         st.info("Aucune donnée journalière pour ce magasin sur les périodes sélectionnées.")
@@ -450,17 +464,17 @@ def render_magasin_fiche(code_magasin: str):
 
 
 # =========================
-# Vues scopes (par périmètre)
+# Vues scopes — parc A/B séparés
 # =========================
 def render_scope_block(title: str, scope_code: str):
     st.markdown(f"## {title}")
 
-    nb_mag_A = count_magasin_query(code_opA, scope_code)
-    nb_mag_B = count_magasin_query(code_opB, scope_code)
+    nb_mag_A = count_magasin_query(code_opA, scope_code, mags_cte_sql_A, mags_cte_params_A)
+    nb_mag_B = count_magasin_query(code_opB, scope_code, mags_cte_sql_B, mags_cte_params_B)
     st.caption(f"Magasins — Année N: **{nb_mag_A}** | Année N-1: **{nb_mag_B}**")
 
-    rA = kpi_query(code_opA, scope_code).iloc[0]
-    rB = kpi_query(code_opB, scope_code).iloc[0]
+    rA = kpi_query(code_opA, scope_code, mags_cte_sql_A, mags_cte_params_A).iloc[0]
+    rB = kpi_query(code_opB, scope_code, mags_cte_sql_B, mags_cte_params_B).iloc[0]
 
     c1, c2, c3 = st.columns(3)
     with c1:
