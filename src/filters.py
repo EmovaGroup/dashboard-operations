@@ -7,7 +7,7 @@ from src.db import read_df
 # =========================
 # DATA LOADERS
 # =========================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_operations() -> pd.DataFrame:
     df = read_df("""
     select
@@ -33,7 +33,7 @@ def load_operations() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_ref_magasin_distincts() -> dict:
     return {
         "magasins": read_df("""
@@ -73,8 +73,6 @@ def load_ref_magasin_distincts() -> dict:
               and "crp_:_region_nationale_d_affectation" <> ''
             order by reg_admin;
         """)["reg_admin"].tolist(),
-
-        # ✅ Enseigne
         "enseignes": read_df("""
             select distinct enseigne
             from public.ref_magasin
@@ -93,18 +91,19 @@ def _init_state():
     ss.setdefault("flt_opA_label", None)
     ss.setdefault("flt_opB_label", None)
 
-    # OP A
-    ss.setdefault("flt_parc_mode_A", "Participants")   # op_magasin
-    ss.setdefault("flt_ermes_mode_A", "Tous")          # ori_ermes
-    ss.setdefault("flt_fid_mode_A", "Tous")            # vw_ktb_with_sms_cost
+    ss.setdefault("flt_parc_mode_A", "Participants")
+    ss.setdefault("flt_ermes_mode_A", "Tous")
+    ss.setdefault("flt_fid_mode_A", "Tous")
 
-    # OP B
-    ss.setdefault("flt_parc_mode_B", "Participants")   # op_magasin
-    ss.setdefault("flt_ermes_mode_B", "Tous")          # ori_ermes
-    ss.setdefault("flt_fid_mode_B", "Tous")            # vw_ktb_with_sms_cost
+    ss.setdefault("flt_parc_mode_B", "Participants")
+    ss.setdefault("flt_ermes_mode_B", "Tous")
+    ss.setdefault("flt_fid_mode_B", "Tous")
 
-    # filtres parc (attributs magasin)
     ss.setdefault("flt_code_magasin", None)
+
+    # ✅ comparable : "Tous" | "C" | "NC"
+    ss.setdefault("flt_comp_mode", "Tous")
+
     ss.setdefault("flt_types", [])
     ss.setdefault("flt_seg", [])
     ss.setdefault("flt_rcr", [])
@@ -115,10 +114,21 @@ def _init_state():
     ss.setdefault("filters_applied", False)
 
 
+def _safe_index(options: list[str], value: str | None, fallback: int = 0) -> int:
+    if not options:
+        return 0
+    if value is None:
+        return min(max(fallback, 0), len(options) - 1)
+    try:
+        return options.index(value)
+    except ValueError:
+        return min(max(fallback, 0), len(options) - 1)
+
+
 # =========================
-# BUILD CTE "mags" (A or B)
+# BUILD BASE CTE "mags0" (A or B)
 # =========================
-def build_mags_cte_sql(
+def build_mags_cte_sql_base(
     code_operation_ref: str,
     parc_mode: str,
     ermes_mode: str,
@@ -132,27 +142,18 @@ def build_mags_cte_sql(
     enseignes: list[str],
 ) -> tuple[str, tuple]:
     """
-    Construit le parc final "mags" en 3 étapes:
-      0) periode_op : période (date_debut/date_fin) via ref_operations
-      1) mags_parc  : magasins qui ont AU MOINS 1 ticket sur la période de l'op
-                      (vw_silver_tickets_detaille_clean_op), puis filtres ref_magasin
-      2) mags_base  : filtre OP (op_magasin) selon parc_mode (Participants/Tous/Non participants)
-      3) mags       : filtre ensuite ERMES puis FID (même code_operation_ref)
-
-    IMPORTANT :
-      - On se fiche du statut actif/ouverture : uniquement présence de tickets sur la période.
-      - Les filtres (type/seg/rcr/régions/enseigne) restent appliqués via ref_magasin.
+    Construit le parc "mags0" en 3 étapes :
+      0) periode_op : période via ref_operations
+      1) mags_parc  : magasins qui ont AU MOINS 1 ticket sur la période (GOLD agrégé)
+      2) mags_base  : filtre OP (op_magasin) selon parc_mode
+      3) mags0      : filtre ensuite ERMES puis FID
     """
 
-    # --- filtres attributs (ref_magasin) ---
-    # NOTE: on met une clause qui marche même si rm est NULL (left join),
-    # donc on commence par exiger rm.code_magasin non null (comme ton code),
-    # et ça garantit que les filtres attributs ne gardent que les magasins connus du référentiel.
     where_parts = ["rm.code_magasin is not null"]
     params: list = []
 
     if code_magasin:
-        where_parts.append("trim(rm.code_magasin::text) = %s")
+        where_parts.append("upper(trim(rm.code_magasin::text)) = upper(trim(%s::text))")
         params.append(code_magasin)
 
     if types:
@@ -176,7 +177,6 @@ def build_mags_cte_sql(
 
     where_sql = " AND ".join(where_parts)
 
-    # --- période OP ---
     periode_op_cte = """
 periode_op as (
   select
@@ -187,33 +187,29 @@ periode_op as (
 )
 """.strip()
 
-    # --- mags_parc = magasins avec au moins 1 ticket sur période ---
-    # (équivalent à ta requête : select distinct code_magasin from vw_silver_tickets_detaille_clean_op where ticket_date between ...)
+    # GOLD (agrégé) + filtre ref_magasin (comme ton fichier d'origine)
     mags_parc_cte = f"""
 mags_parc as (
-  select distinct trim(t.code_magasin::text) as code_magasin
-  from public.vw_silver_tickets_detaille_clean_op t
+  select distinct upper(trim(st.code_magasin::text)) as code_magasin
+  from public.vw_gold_tickets_jour_clean_op st
   cross join periode_op p
   left join public.ref_magasin rm
-    on trim(rm.code_magasin::text) = trim(t.code_magasin::text)
-  where t.code_magasin is not null
-    and t.ticket_date >= p.date_debut
-    and t.ticket_date <= p.date_fin
+    on upper(trim(rm.code_magasin::text)) = upper(trim(st.code_magasin::text))
+  where st.code_magasin is not null
+    and st.ticket_date >= p.date_debut
+    and st.ticket_date <= p.date_fin
     and {where_sql}
 )
 """.strip()
 
-    # --- participants OP ---
     mags_op_cte = """
 mags_op as (
-  select distinct trim(code_magasin::text) as code_magasin
+  select distinct upper(trim(code_magasin::text)) as code_magasin
   from public.op_magasin
   where code_operation = %s
 )
 """.strip()
 
-    # --- base selon parc_mode ---
-    # (on garde ton fallback actuel pour "Participants" si op_magasin est vide)
     if parc_mode == "Tous":
         mags_base_cte = """
 mags_base as (
@@ -252,10 +248,9 @@ mags_base as (
         parc_params = [code_operation_ref]
         include_mags_op = True
 
-    # --- ERMES ---
     ermes_op_cte = """
 ermes_op as (
-  select distinct trim(e.code_magasin::text) as code_magasin
+  select distinct upper(trim(e.code_magasin::text)) as code_magasin
   from public.ori_ermes e
   where e.code_operation = %s
     and e.code_magasin is not null
@@ -273,10 +268,9 @@ mags_after_ermes as (
 )
 """.strip()
 
-    # --- FID ---
     fid_op_cte = """
 fid_op as (
-  select distinct trim(k.code_magasin::text) as code_magasin
+  select distinct upper(trim(k.code_magasin::text)) as code_magasin
   from public.vw_ktb_with_sms_cost k
   where k.code_operation = %s
     and k.code_magasin is not null
@@ -284,7 +278,7 @@ fid_op as (
 """.strip()
 
     fid_filter_cte = """
-mags as (
+mags0 as (
   select m.code_magasin
   from mags_after_ermes m
   where
@@ -301,22 +295,139 @@ mags as (
 
     sql = "WITH " + ",\n".join(ctes)
 
-    # ordre des params = ordre des %s dans les CTE
+    # ✅ IMPORTANT : ordre des params = ordre des %s dans le SQL
     final_params: list = []
     final_params += [code_operation_ref]   # periode_op
-
-    final_params += parc_params            # (optionnel) code_operation pour op_magasin
-
+    final_params += parc_params            # (optionnel) op_magasin
     final_params += params                 # filtres ref_magasin (dans mags_parc)
-
     final_params += [code_operation_ref]   # ermes_op
     final_params += [ermes_mode, ermes_mode, ermes_mode]
-
     final_params += [code_operation_ref]   # fid_op
     final_params += [fid_mode, fid_mode, fid_mode]
 
     return sql, tuple(final_params)
 
+
+# =========================
+# SQL — compute comparable canonical set (intersection A/B)
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def compute_comparable_canons(
+    mags_cte_sql_A_base: str, mags_params_A_base: tuple,
+    mags_cte_sql_B_base: str, mags_params_B_base: tuple,
+) -> list[str]:
+    sql = f"""
+WITH
+magsA AS (
+  SELECT DISTINCT code_magasin
+  FROM (
+    {mags_cte_sql_A_base}
+    SELECT DISTINCT code_magasin
+    FROM mags0
+  ) qA
+),
+magsB AS (
+  SELECT DISTINCT code_magasin
+  FROM (
+    {mags_cte_sql_B_base}
+    SELECT DISTINCT code_magasin
+    FROM mags0
+  ) qB
+),
+map AS (
+  SELECT ancien_code, code_magasin
+  FROM public.vw_param_magasin_ancien_code
+),
+canonA AS (
+  SELECT DISTINCT
+    a.code_magasin AS code_src,
+    COALESCE(m.code_magasin, a.code_magasin) AS canon
+  FROM magsA a
+  LEFT JOIN map m ON m.ancien_code = a.code_magasin
+),
+canonB AS (
+  SELECT DISTINCT
+    b.code_magasin AS code_src,
+    COALESCE(m.code_magasin, b.code_magasin) AS canon
+  FROM magsB b
+  LEFT JOIN map m ON m.ancien_code = b.code_magasin
+),
+comparables AS (
+  SELECT DISTINCT a.canon
+  FROM canonA a
+  JOIN canonB b ON b.canon = a.canon
+  WHERE left(a.code_src, 2) = left(a.canon, 2)
+    AND left(b.code_src, 2) = left(b.canon, 2)
+    AND left(a.canon, 2) = left(b.canon, 2)
+)
+SELECT canon
+FROM comparables
+ORDER BY canon;
+"""
+    params = tuple(list(mags_params_A_base) + list(mags_params_B_base))
+    df = read_df(sql, params=params)
+    if df.empty:
+        return []
+    return df["canon"].astype(str).tolist()
+
+
+# =========================
+# Apply comparable mode on top of mags0 -> mags
+# =========================
+def apply_comparable_filter_cte(
+    base_sql: str,
+    base_params: tuple,
+    comp_mode: str,          # "Tous" | "C" | "NC"
+    comp_canons: list[str],  # canons (codes magasins communs)
+) -> tuple[str, tuple]:
+    """
+    FIX IMPORTANT :
+    - Comparable = C  ➜ mags = EXACTEMENT comp_canons
+      ➜ même parc garanti côté A et côté B
+    """
+
+    # ✅ Comparable STRICT = intersection figée
+    if comp_mode == "C":
+        add_sql = """
+,
+mags as (
+  select distinct upper(trim(x::text)) as code_magasin
+  from unnest(%s::text[]) as t(x)
+)
+""".rstrip()
+
+        params = list(base_params) + [comp_canons]
+        return base_sql + add_sql, tuple(params)
+
+    # Cas Tous / NC : logique classique depuis mags0
+    add_sql = """
+,
+map as (
+  select ancien_code, code_magasin
+  from public.vw_param_magasin_ancien_code
+),
+mags as (
+  select distinct
+    upper(trim(coalesce(mp.code_magasin, m0.code_magasin)::text)) as code_magasin
+  from mags0 m0
+  left join map mp
+    on mp.ancien_code = m0.code_magasin
+  where
+    (
+      %s = 'Tous'
+      OR (
+        %s = 'NC'
+        AND NOT (
+          coalesce(mp.code_magasin, m0.code_magasin) = any(%s)
+          AND left(m0.code_magasin, 2) = left(coalesce(mp.code_magasin, m0.code_magasin), 2)
+        )
+      )
+    )
+)
+""".rstrip()
+
+    params = list(base_params) + [comp_mode, comp_mode, comp_canons]
+    return base_sql + add_sql, tuple(params)
 
 # =========================
 # RENDER FILTERS (shared)
@@ -331,54 +442,63 @@ def render_filters() -> dict:
 
     refd = load_ref_magasin_distincts()
 
-    if st.session_state["flt_opA_label"] is None:
-        st.session_state["flt_opA_label"] = ops["label"].iloc[0]
-    if st.session_state["flt_opB_label"] is None:
-        st.session_state["flt_opB_label"] = ops["label"].iloc[1] if len(ops) > 1 else ops["label"].iloc[0]
+    # ✅ dernière op (par date_debut desc)
+    latest_label = ops["label"].iloc[0]
+
+    # ✅ affichage en ordre alphabétique
+    ops_alpha = ops.sort_values("label", ascending=True).reset_index(drop=True)
+    labels_ops_alpha = ops_alpha["label"].tolist()
+
+    # ✅ defaults = dernière op ajoutée
+    if st.session_state["flt_opA_label"] is None or st.session_state["flt_opA_label"] not in labels_ops_alpha:
+        st.session_state["flt_opA_label"] = latest_label
+    if st.session_state["flt_opB_label"] is None or st.session_state["flt_opB_label"] not in labels_ops_alpha:
+        st.session_state["flt_opB_label"] = latest_label
 
     PARC_CHOICES = ["Participants", "Tous", "Non participants"]
+    COMP_CHOICES = ["Tous", "C", "NC"]
 
     with st.expander("Filtres", expanded=True):
         with st.form("filters_form", clear_on_submit=False):
 
-            # ✅ 2 colonnes : gauche A / droite B
             left, right = st.columns(2)
 
             with left:
                 st.selectbox(
                     "Opération A",
-                    ops["label"].tolist(),
-                    index=ops["label"].tolist().index(st.session_state["flt_opA_label"]),
+                    labels_ops_alpha,
+                    index=_safe_index(labels_ops_alpha, st.session_state["flt_opA_label"], 0),
                     key="form_opA",
                 )
                 st.caption("Parcs — Opération A")
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    st.selectbox("Parc OP", PARC_CHOICES, PARC_CHOICES.index(st.session_state["flt_parc_mode_A"]), key="form_parc_mode_A")
+                    st.selectbox("Parc OP", PARC_CHOICES, index=_safe_index(PARC_CHOICES, st.session_state["flt_parc_mode_A"], 0), key="form_parc_mode_A")
                 with c2:
-                    st.selectbox("ERMES", PARC_CHOICES, PARC_CHOICES.index(st.session_state["flt_ermes_mode_A"]), key="form_ermes_mode_A")
+                    st.selectbox("ERMES", PARC_CHOICES, index=_safe_index(PARC_CHOICES, st.session_state["flt_ermes_mode_A"], 0), key="form_ermes_mode_A")
                 with c3:
-                    st.selectbox("FID", PARC_CHOICES, PARC_CHOICES.index(st.session_state["flt_fid_mode_A"]), key="form_fid_mode_A")
+                    st.selectbox("FID", PARC_CHOICES, index=_safe_index(PARC_CHOICES, st.session_state["flt_fid_mode_A"], 0), key="form_fid_mode_A")
 
             with right:
                 st.selectbox(
                     "Opération B",
-                    ops["label"].tolist(),
-                    index=ops["label"].tolist().index(st.session_state["flt_opB_label"]),
+                    labels_ops_alpha,
+                    index=_safe_index(labels_ops_alpha, st.session_state["flt_opB_label"], 0),
                     key="form_opB",
                 )
                 st.caption("Parcs — Opération B")
                 d1, d2, d3 = st.columns(3)
                 with d1:
-                    st.selectbox("Parc OP", PARC_CHOICES, PARC_CHOICES.index(st.session_state["flt_parc_mode_B"]), key="form_parc_mode_B")
+                    st.selectbox("Parc OP", PARC_CHOICES, index=_safe_index(PARC_CHOICES, st.session_state["flt_parc_mode_B"], 0), key="form_parc_mode_B")
                 with d2:
-                    st.selectbox("ERMES", PARC_CHOICES, PARC_CHOICES.index(st.session_state["flt_ermes_mode_B"]), key="form_ermes_mode_B")
+                    st.selectbox("ERMES", PARC_CHOICES, index=_safe_index(PARC_CHOICES, st.session_state["flt_ermes_mode_B"], 0), key="form_ermes_mode_B")
                 with d3:
-                    st.selectbox("FID", PARC_CHOICES, PARC_CHOICES.index(st.session_state["flt_fid_mode_B"]), key="form_fid_mode_B")
+                    st.selectbox("FID", PARC_CHOICES, index=_safe_index(PARC_CHOICES, st.session_state["flt_fid_mode_B"], 0), key="form_fid_mode_B")
 
             st.divider()
 
             magasins_df = refd["magasins"].copy()
+            magasins_df["code_magasin"] = magasins_df["code_magasin"].astype(str).str.strip()
             magasins_df["label"] = magasins_df["code_magasin"] + " — " + magasins_df["nom_magasin"].fillna("")
             labels_mag = ["(Tous)"] + magasins_df["label"].tolist()
 
@@ -388,14 +508,22 @@ def render_filters() -> dict:
                 if not m.empty:
                     default_mag_label = m.iloc[0]["label"]
 
-            st.selectbox(
-                "Magasin (optionnel)",
-                labels_mag,
-                index=labels_mag.index(default_mag_label),
-                key="form_magasin",
-            )
+            mag_col, comp_col = st.columns([2, 1])
+            with mag_col:
+                st.selectbox(
+                    "Magasin (optionnel)",
+                    labels_mag,
+                    index=_safe_index(labels_mag, default_mag_label, 0),
+                    key="form_magasin",
+                )
+            with comp_col:
+                st.selectbox(
+                    "Comparable",
+                    COMP_CHOICES,
+                    index=_safe_index(COMP_CHOICES, st.session_state["flt_comp_mode"], 0),
+                    key="form_comp_mode",
+                )
 
-            # Ligne 1 : Région élargie | Région admin | Type magasin
             row1_a, row1_b, row1_c = st.columns(3)
             with row1_a:
                 reg_elargie = st.multiselect("Région élargie", refd["reg_elargie"], st.session_state["flt_reg_elargie"], key="form_reg_elargie")
@@ -404,7 +532,6 @@ def render_filters() -> dict:
             with row1_c:
                 types = st.multiselect("Type magasin", refd["types"], st.session_state["flt_types"], key="form_types")
 
-            # Ligne 2 : RCR | Segmentation | Enseigne
             row2_a, row2_b, row2_c = st.columns(3)
             with row2_a:
                 rcr = st.multiselect("RCR", refd["rcr"], st.session_state["flt_rcr"], key="form_rcr")
@@ -420,8 +547,8 @@ def render_filters() -> dict:
                 reset = st.form_submit_button("↩️ Réinitialiser", use_container_width=True)
 
             if reset:
-                st.session_state["flt_opA_label"] = ops["label"].iloc[0]
-                st.session_state["flt_opB_label"] = ops["label"].iloc[1] if len(ops) > 1 else ops["label"].iloc[0]
+                st.session_state["flt_opA_label"] = latest_label
+                st.session_state["flt_opB_label"] = latest_label
 
                 st.session_state["flt_parc_mode_A"] = "Participants"
                 st.session_state["flt_ermes_mode_A"] = "Tous"
@@ -432,6 +559,8 @@ def render_filters() -> dict:
                 st.session_state["flt_fid_mode_B"] = "Tous"
 
                 st.session_state["flt_code_magasin"] = None
+                st.session_state["flt_comp_mode"] = "Tous"
+
                 st.session_state["flt_types"] = []
                 st.session_state["flt_seg"] = []
                 st.session_state["flt_rcr"] = []
@@ -457,6 +586,8 @@ def render_filters() -> dict:
                 else:
                     st.session_state["flt_code_magasin"] = st.session_state["form_magasin"].split(" — ")[0].strip()
 
+                st.session_state["flt_comp_mode"] = st.session_state["form_comp_mode"]
+
                 st.session_state["flt_reg_elargie"] = reg_elargie
                 st.session_state["flt_reg_admin"] = reg_admin
                 st.session_state["flt_rcr"] = rcr
@@ -470,13 +601,14 @@ def render_filters() -> dict:
         st.info("Choisis tes filtres puis clique sur **✅ Appliquer les filtres**.")
         st.stop()
 
+    # ✅ récupérer opA / opB depuis ops (pas ops_alpha) grâce au label
     opA = ops.loc[ops["label"] == st.session_state["flt_opA_label"]].iloc[0]
     opB = ops.loc[ops["label"] == st.session_state["flt_opB_label"]].iloc[0]
 
     code_opA, lib_opA = opA["code_operation"], opA["libelle_op"]
     code_opB, lib_opB = opB["code_operation"], opB["libelle_op"]
 
-    mags_cte_sql_A, mags_cte_params_A = build_mags_cte_sql(
+    base_sql_A, base_params_A = build_mags_cte_sql_base(
         code_operation_ref=code_opA,
         parc_mode=st.session_state["flt_parc_mode_A"],
         ermes_mode=st.session_state["flt_ermes_mode_A"],
@@ -490,7 +622,7 @@ def render_filters() -> dict:
         enseignes=st.session_state["flt_enseignes"],
     )
 
-    mags_cte_sql_B, mags_cte_params_B = build_mags_cte_sql(
+    base_sql_B, base_params_B = build_mags_cte_sql_base(
         code_operation_ref=code_opB,
         parc_mode=st.session_state["flt_parc_mode_B"],
         ermes_mode=st.session_state["flt_ermes_mode_B"],
@@ -504,21 +636,23 @@ def render_filters() -> dict:
         enseignes=st.session_state["flt_enseignes"],
     )
 
-    # ✅ Retour contexte
+    comp_mode = st.session_state["flt_comp_mode"]
+
+    with st.spinner("Données en cours de chargement… merci de patienter."):
+        comp_canons = compute_comparable_canons(base_sql_A, base_params_A, base_sql_B, base_params_B)
+
+    mags_cte_sql_A, mags_cte_params_A = apply_comparable_filter_cte(base_sql_A, base_params_A, comp_mode, comp_canons)
+    mags_cte_sql_B, mags_cte_params_B = apply_comparable_filter_cte(base_sql_B, base_params_B, comp_mode, comp_canons)
+
     return {
         "opA": {"code": code_opA, "lib": lib_opA, "date_debut": opA["date_debut"], "date_fin": opA["date_fin"]},
         "opB": {"code": code_opB, "lib": lib_opB, "date_debut": opB["date_debut"], "date_fin": opB["date_fin"]},
 
-        "parc_mode_A": st.session_state["flt_parc_mode_A"],
-        "ermes_mode_A": st.session_state["flt_ermes_mode_A"],
-        "fid_mode_A": st.session_state["flt_fid_mode_A"],
-
-        "parc_mode_B": st.session_state["flt_parc_mode_B"],
-        "ermes_mode_B": st.session_state["flt_ermes_mode_B"],
-        "fid_mode_B": st.session_state["flt_fid_mode_B"],
+        "comparable": comp_mode,
 
         "filters": {
             "code_magasin": st.session_state["flt_code_magasin"],
+            "comp_mode": comp_mode,
             "types": st.session_state["flt_types"],
             "seg": st.session_state["flt_seg"],
             "rcr": st.session_state["flt_rcr"],
@@ -527,13 +661,30 @@ def render_filters() -> dict:
             "enseignes": st.session_state["flt_enseignes"],
         },
 
-        # ✅ nouveaux (A/B)
         "mags_cte_sql_A": mags_cte_sql_A,
         "mags_cte_params_A": mags_cte_params_A,
         "mags_cte_sql_B": mags_cte_sql_B,
         "mags_cte_params_B": mags_cte_params_B,
 
-        # ✅ anciens (rétro compat)
+        # rétro compat (A par défaut)
         "mags_cte_sql": mags_cte_sql_A,
         "mags_cte_params": mags_cte_params_A,
     }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_selected_mags(mags_cte_sql_: str, mags_cte_params_: tuple) -> list[str]:
+    """
+    Exécute UNE fois le CTE mags et renvoie la liste des codes magasins (canoniques).
+    Permet ensuite d'éviter de rejouer le CTE dans toutes les requêtes (timeout).
+    """
+    sql = f"""
+{mags_cte_sql_}
+select distinct upper(trim(code_magasin::text)) as code_magasin
+from mags
+order by 1;
+"""
+    df = read_df(sql, mags_cte_params_)
+    if df.empty:
+        return []
+    return df["code_magasin"].astype(str).tolist()

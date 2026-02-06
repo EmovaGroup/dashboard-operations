@@ -2,22 +2,14 @@
 # -----------------------------------------------------------------------------
 # MARKETING — Dashboard (A vs B)
 #
-# ✅ Basé sur ta table ERMES :
-# public.ori_ermes(code_operation, ..., pack numeric, ...)
+# ✅ Objectif : réduire le temps de chargement + spinner unique (comme Commerce)
+# - Tous les @st.cache_data : show_spinner=False (évite le “Running …” Streamlit)
+# - Spinner custom autour des blocs lourds
 #
-# ✅ Hypothèses / conventions :
-# - Investissement ERMES = ori_ermes.pack
-# - Investissement FID = vw_ktb_with_sms_cost.cout_sms_total_eur
-# - Nb magasins pack ERMES = count(distinct code_magasin) dans ori_ermes sur l'op
-# - Nb magasins KTB = count(distinct code_magasin) dans vw_ktb_with_sms_cost sur l'op
-# - CA actifs = sum(ori_ktb.ca_actifs)
-#
-# ✅ Correctifs inclus :
-# - Parcs séparés A / B : mags_cte_sql_A + mags_cte_sql_B (via render_filters)
-# - Types numériques sécurisés (pack est numeric => pas de COALESCE texte/int)
-# - KPI commerce (CA/tickets/PM) au-dessus
-# - KPI ERMES/KTB séparés + % sur parc
-# - Tables région + pack distribution + régressions (points + fit + R²)
+# ✅ IMPORTANT (FIX) :
+# Le CTE généré par filters.py peut déjà contenir un CTE "map".
+# Donc dans cette page, on utilise TOUJOURS "map2" pour éviter :
+#   WITH query name "map" specified more than once
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -48,8 +40,9 @@ POIDS_MV_MAP = {
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
     "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
     "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
-    # 👉 Ajoute ici les futur mv_op_annee_poids_op_periode_op_magasin 
 }
+
+SPINNER_TXT = "Données en cours de chargement… merci de patienter."
 
 # =============================================================================
 # Helpers
@@ -193,23 +186,35 @@ def _plot_reg(
 
 # =============================================================================
 # Loader — “Commerce light” (CA / tickets / panier moyen) sur la période
+# ✅ map2 (pas map) pour éviter collision avec filters.py
 # =============================================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_commerce_light(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> dict:
     sql = f"""
 {mags_cte_sql_},
 
+map2 as (
+  select
+    upper(trim(ancien_code::text)) as ancien_code,
+    upper(trim(code_magasin::text)) as code_magasin
+  from public.vw_param_magasin_ancien_code
+),
+
 base as (
   select
-    trim(st.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(st.code_magasin::text))) as code_magasin,
     st.ticket_date,
     coalesce(st.nb_tickets, 0)::numeric as nb_tickets,
     coalesce(st.total_ttc_net, 0)::numeric as ca_ttc_net
   from public.vw_gold_tickets_jour_clean_op st
-  join mags m on m.code_magasin = trim(st.code_magasin::text)
+  left join map2 m2
+    on m2.ancien_code = upper(trim(st.code_magasin::text))
+  join mags m
+    on m.code_magasin = coalesce(m2.code_magasin, upper(trim(st.code_magasin::text)))
   where st.ticket_date >= %s::date
     and st.ticket_date <= %s::date
 )
+
 select
   round(coalesce(sum(ca_ttc_net),0), 2) as ca_total,
   round(coalesce(sum(nb_tickets),0), 0) as tickets_total,
@@ -230,11 +235,20 @@ from base;
 
 # =============================================================================
 # Loader — métriques marketing (A ou B) sur le parc filtré
+# ✅ FIX SQL : SELECT ... FROM agg
+# ✅ map2 (pas map)
 # =============================================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_marketing_metrics(mags_cte_sql_: str, mags_cte_params_: tuple, code_operation: str) -> dict:
     sql = f"""
 {mags_cte_sql_},
+
+map2 as (
+  select
+    upper(trim(ancien_code::text)) as ancien_code,
+    upper(trim(code_magasin::text)) as code_magasin
+  from public.vw_param_magasin_ancien_code
+),
 
 parc as (
   select count(*)::numeric as parc_magasin
@@ -243,9 +257,11 @@ parc as (
 
 ermes as (
   select
-    trim(e.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(e.code_magasin::text))) as code_magasin,
     coalesce(e.pack, 0)::numeric as pack_eur
   from public.ori_ermes e
+  left join map2 m2
+    on m2.ancien_code = upper(trim(e.code_magasin::text))
   where e.code_operation = %s
     and e.code_magasin is not null
 ),
@@ -255,11 +271,13 @@ ermes_mags as (
 
 ktb_cost as (
   select
-    trim(k.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(k.code_magasin::text))) as code_magasin,
     coalesce(k.nb_sms_envoyes, 0)::numeric as nb_sms,
     coalesce(k.cout_sms_total_eur, 0)::numeric as cout_sms_total_eur,
     coalesce(k.tx_actifs, 0)::numeric as tx_actifs
   from public.vw_ktb_with_sms_cost k
+  left join map2 m2
+    on m2.ancien_code = upper(trim(k.code_magasin::text))
   where k.code_operation = %s
     and k.code_magasin is not null
 ),
@@ -269,9 +287,11 @@ ktb_cost_mags as (
 
 ktb_ori as (
   select
-    trim(o.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(o.code_magasin::text))) as code_magasin,
     coalesce(o.ca_actifs, 0)::numeric as ca_actifs
   from public.ori_ktb o
+  left join map2 m2
+    on m2.ancien_code = upper(trim(o.code_magasin::text))
   where o.code_operation = %s
     and o.code_magasin is not null
 ),
@@ -312,8 +332,12 @@ agg as (
         select code_magasin from ktb_cost_mags
     ) u) as nb_mag_marketing
 )
+
 select
   parc_magasin,
+
+  nb_mag_marketing,
+  round(100 * nb_mag_marketing::numeric / nullif(parc_magasin, 0), 2) as pct_mag_marketing,
 
   nb_mag_ermes,
   round(invest_ermes_total_eur, 2) as invest_ermes_total_eur,
@@ -332,7 +356,6 @@ select
     / nullif(nb_mag_marketing, 0),
     2
   ) as invest_total_moy_eur,
-  round(100 * nb_mag_marketing::numeric / nullif(parc_magasin, 0), 2) as pct_mag_marketing,
 
   round(coalesce(tx_activation_moyen, 0), 6) as tx_activation_moyen,
   round(coalesce(ca_actifs_total, 0), 2) as ca_actifs_total
@@ -410,30 +433,41 @@ def _render_pretty_table(df: pd.DataFrame):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-def _render_region_table(
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_region_table_df(
     region_field_sql: str,
-    title: str,
     mags_cte_sql_: str,
     mags_cte_params_: tuple,
     code_operation: str,
-):
+) -> pd.DataFrame:
     sql_region = f"""
 {mags_cte_sql_},
 
+map2 as (
+  select
+    upper(trim(ancien_code::text)) as ancien_code,
+    upper(trim(code_magasin::text)) as code_magasin
+  from public.vw_param_magasin_ancien_code
+),
+
 ermes as (
   select
-    trim(e.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(e.code_magasin::text))) as code_magasin,
     coalesce(e.pack, 0)::numeric as invest_ermes_eur
   from public.ori_ermes e
+  left join map2 m2
+    on m2.ancien_code = upper(trim(e.code_magasin::text))
   where e.code_operation = %s
     and e.code_magasin is not null
 ),
 
 ktb as (
   select
-    trim(k.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(k.code_magasin::text))) as code_magasin,
     coalesce(k.cout_sms_total_eur, 0)::numeric as invest_fid_eur
   from public.vw_ktb_with_sms_cost k
+  left join map2 m2
+    on m2.ancien_code = upper(trim(k.code_magasin::text))
   where k.code_operation = %s
     and k.code_magasin is not null
 ),
@@ -447,8 +481,9 @@ base as (
     coalesce(e.invest_ermes_eur, 0) + coalesce(k.invest_fid_eur, 0) as invest_total_eur
   from mags m
   left join ermes e using(code_magasin)
-  left join ktb k using(code_magasin)
-  left join public.ref_magasin rm on trim(rm.code_magasin::text) = m.code_magasin
+  left join ktb   k using(code_magasin)
+  left join public.ref_magasin rm
+    on upper(trim(rm.code_magasin::text)) = m.code_magasin
 )
 
 select
@@ -464,7 +499,17 @@ from base
 group by region
 order by invest_total_eur desc;
 """
-    df = read_df(sql_region, tuple(list(mags_cte_params_) + [code_operation, code_operation]))
+    return read_df(sql_region, tuple(list(mags_cte_params_) + [code_operation, code_operation]))
+
+
+def _render_region_table(
+    region_field_sql: str,
+    title: str,
+    mags_cte_sql_: str,
+    mags_cte_params_: tuple,
+    code_operation: str,
+):
+    df = _load_region_table_df(region_field_sql, mags_cte_sql_, mags_cte_params_, code_operation)
     st.markdown(f"### {title}")
     _render_pretty_table(_prettify_region_df(df))
 
@@ -472,16 +517,25 @@ order by invest_total_eur desc;
 # =============================================================================
 # Packs ERMES — distribution nb magasins
 # =============================================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_pack_distribution(mags_cte_sql_: str, mags_cte_params_: tuple, code_operation: str) -> pd.DataFrame:
     sql = f"""
 {mags_cte_sql_},
 
+map2 as (
+  select
+    upper(trim(ancien_code::text)) as ancien_code,
+    upper(trim(code_magasin::text)) as code_magasin
+  from public.vw_param_magasin_ancien_code
+),
+
 ermes as (
   select
-    trim(e.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(e.code_magasin::text))) as code_magasin,
     round(coalesce(e.pack, 0)::numeric, 2) as pack_eur
   from public.ori_ermes e
+  left join map2 m2
+    on m2.ancien_code = upper(trim(e.code_magasin::text))
   where e.code_operation = %s
     and e.code_magasin is not null
 ),
@@ -502,7 +556,9 @@ order by pack_eur;
 
 # =============================================================================
 # Loader — données régression (A ou B)
+# ✅ map2 (pas map) + FIX AMBIGU : qualifier p0.code_magasin
 # =============================================================================
+@st.cache_data(ttl=600, show_spinner=False)
 def _load_reg_data(
     code_operation: str,
     poids_mv: str,
@@ -510,13 +566,24 @@ def _load_reg_data(
     mags_cte_sql_: str,
     mags_cte_params_: tuple,
 ) -> pd.DataFrame:
+    map2_cte = """
+map2 as (
+  select
+    upper(trim(ancien_code::text)) as ancien_code,
+    upper(trim(code_magasin::text)) as code_magasin
+  from public.vw_param_magasin_ancien_code
+)
+""".strip()
+
     if invest_mode == "ermes":
         invest_cte = """
 invest as (
   select
-    trim(e.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(e.code_magasin::text))) as code_magasin,
     coalesce(e.pack, 0)::numeric as invest_eur
   from public.ori_ermes e
+  left join map2 m2
+    on m2.ancien_code = upper(trim(e.code_magasin::text))
   where e.code_operation = %s
     and e.code_magasin is not null
 )
@@ -527,9 +594,11 @@ invest as (
         invest_cte = """
 invest as (
   select
-    trim(k.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(k.code_magasin::text))) as code_magasin,
     coalesce(k.cout_sms_total_eur, 0)::numeric as invest_eur
   from public.vw_ktb_with_sms_cost k
+  left join map2 m2
+    on m2.ancien_code = upper(trim(k.code_magasin::text))
   where k.code_operation = %s
     and k.code_magasin is not null
 )
@@ -540,17 +609,21 @@ invest as (
         invest_cte = """
 ermes as (
   select
-    trim(e.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(e.code_magasin::text))) as code_magasin,
     coalesce(e.pack, 0)::numeric as invest_ermes_eur
   from public.ori_ermes e
+  left join map2 m2
+    on m2.ancien_code = upper(trim(e.code_magasin::text))
   where e.code_operation = %s
     and e.code_magasin is not null
 ),
 fid as (
   select
-    trim(k.code_magasin::text) as code_magasin,
+    coalesce(m2.code_magasin, upper(trim(k.code_magasin::text))) as code_magasin,
     coalesce(k.cout_sms_total_eur, 0)::numeric as invest_fid_eur
   from public.vw_ktb_with_sms_cost k
+  left join map2 m2
+    on m2.ancien_code = upper(trim(k.code_magasin::text))
   where k.code_operation = %s
     and k.code_magasin is not null
 ),
@@ -567,14 +640,17 @@ invest as (
 
     sql = f"""
 {mags_cte_sql_},
+{map2_cte},
 {invest_cte},
 
 poids as (
   select
-    trim(code_magasin::text) as code_magasin,
-    coalesce(poids_ca, 0)::numeric as poids_ca,
-    coalesce(poids_volume, 0)::numeric as poids_volume
-  from {poids_mv}
+    coalesce(m2.code_magasin, upper(trim(p0.code_magasin::text))) as code_magasin,
+    coalesce(p0.poids_ca, 0)::numeric as poids_ca,
+    coalesce(p0.poids_volume, 0)::numeric as poids_volume
+  from {poids_mv} p0
+  left join map2 m2
+    on m2.ancien_code = upper(trim(p0.code_magasin::text))
 )
 
 select
@@ -584,7 +660,7 @@ select
   coalesce(p.poids_volume, 0)::numeric as poids_volume
 from mags m
 left join invest i using(code_magasin)
-left join poids p using(code_magasin)
+left join poids  p using(code_magasin)
 where p.code_magasin is not null;
 """
     params = tuple(list(mags_cte_params_) + params_extra)
@@ -623,10 +699,8 @@ lib_opB = ctx["opB"]["lib"]
 dateB0 = str(ctx["opB"]["date_debut"])
 dateB1 = str(ctx["opB"]["date_fin"])
 
-# ✅ IMPORTANT : parcs séparés A / B
 mags_cte_sql_A = ctx["mags_cte_sql_A"]
 mags_cte_params_A = ctx["mags_cte_params_A"]
-
 mags_cte_sql_B = ctx["mags_cte_sql_B"]
 mags_cte_params_B = ctx["mags_cte_params_B"]
 
@@ -637,9 +711,9 @@ label_B = lib_opB
 # KPI COMMERCE (au-dessus)
 # =============================================================================
 st.markdown("## 🧾 Contexte commerce (sur la période) — A vs B")
-
-cA = load_commerce_light(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
-cB = load_commerce_light(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
+with st.spinner(SPINNER_TXT):
+    cA = load_commerce_light(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
+    cB = load_commerce_light(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
 
 kc = st.columns(3)
 with kc[0]:
@@ -654,11 +728,12 @@ st.divider()
 # =============================================================================
 # KPI MARKETING
 # =============================================================================
-mA = load_marketing_metrics(mags_cte_sql_A, mags_cte_params_A, code_opA)
-mB = load_marketing_metrics(mags_cte_sql_B, mags_cte_params_B, code_opB)
-
 st.markdown("## 📣 Marketing — Investissement (ERMES + FID)")
 st.divider()
+
+with st.spinner(SPINNER_TXT):
+    mA = load_marketing_metrics(mags_cte_sql_A, mags_cte_params_A, code_opA)
+    mB = load_marketing_metrics(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
 # --- TOTAL
 rt1, rt2, rt3 = st.columns(3)
@@ -691,7 +766,8 @@ with rf4:
         "Taux d’activation fidèles (KTB)",
         _as_rate01(mA["tx_activation_moyen"]) * 100.0,
         _as_rate01(mB["tx_activation_moyen"]) * 100.0,
-        label_A, label_B,
+        label_A,
+        label_B,
         formatter=lambda x: f"{float(x or 0):.1f} %",
     )
 
@@ -708,8 +784,9 @@ st.divider()
 # TABLEAUX PAR REGION (Op A)
 # =============================================================================
 st.markdown("## 🌍 Investissement marketing par région (Opération A)")
-_render_region_table('rm."crp_:_region_elargie"', "Par région élargie", mags_cte_sql_A, mags_cte_params_A, code_opA)
-_render_region_table('rm."crp_:_region_nationale_d_affectation"', "Par région administrative", mags_cte_sql_A, mags_cte_params_A, code_opA)
+with st.spinner(SPINNER_TXT):
+    _render_region_table('rm."crp_:_region_elargie"', "Par région élargie", mags_cte_sql_A, mags_cte_params_A, code_opA)
+    _render_region_table('rm."crp_:_region_nationale_d_affectation"', "Par région administrative", mags_cte_sql_A, mags_cte_params_A, code_opA)
 
 st.divider()
 
@@ -717,9 +794,9 @@ st.divider()
 # PACK ERMES : nb magasins A vs B
 # =============================================================================
 st.markdown("## 🍰 Répartition des packs — nb magasins (A vs B)")
-
-df_pack_A = load_pack_distribution(mags_cte_sql_A, mags_cte_params_A, code_opA)
-df_pack_B = load_pack_distribution(mags_cte_sql_B, mags_cte_params_B, code_opB)
+with st.spinner(SPINNER_TXT):
+    df_pack_A = load_pack_distribution(mags_cte_sql_A, mags_cte_params_A, code_opA)
+    df_pack_B = load_pack_distribution(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
 c1, c2 = st.columns(2)
 with c1:
@@ -755,14 +832,15 @@ if not poids_mv_A or not poids_mv_B:
     )
     st.stop()
 
-dfA_ermes = _load_reg_data(code_opA, poids_mv_A, "ermes", mags_cte_sql_A, mags_cte_params_A)
-dfB_ermes = _load_reg_data(code_opB, poids_mv_B, "ermes", mags_cte_sql_B, mags_cte_params_B)
+with st.spinner(SPINNER_TXT):
+    dfA_ermes = _load_reg_data(code_opA, poids_mv_A, "ermes", mags_cte_sql_A, mags_cte_params_A)
+    dfB_ermes = _load_reg_data(code_opB, poids_mv_B, "ermes", mags_cte_sql_B, mags_cte_params_B)
 
-dfA_fid = _load_reg_data(code_opA, poids_mv_A, "fid", mags_cte_sql_A, mags_cte_params_A)
-dfB_fid = _load_reg_data(code_opB, poids_mv_B, "fid", mags_cte_sql_B, mags_cte_params_B)
+    dfA_fid = _load_reg_data(code_opA, poids_mv_A, "fid", mags_cte_sql_A, mags_cte_params_A)
+    dfB_fid = _load_reg_data(code_opB, poids_mv_B, "fid", mags_cte_sql_B, mags_cte_params_B)
 
-dfA_total = _load_reg_data(code_opA, poids_mv_A, "total", mags_cte_sql_A, mags_cte_params_A)
-dfB_total = _load_reg_data(code_opB, poids_mv_B, "total", mags_cte_sql_B, mags_cte_params_B)
+    dfA_total = _load_reg_data(code_opA, poids_mv_A, "total", mags_cte_sql_A, mags_cte_params_A)
+    dfB_total = _load_reg_data(code_opB, poids_mv_B, "total", mags_cte_sql_B, mags_cte_params_B)
 
 st.markdown("### Poids OP en VALEUR (CA)")
 _plot_reg("ERMES : Investissement vs Poids OP (CA) — A vs B", "Investissement ERMES (€)", "poids_ca", dfA_ermes, dfB_ermes, label_A, label_B)

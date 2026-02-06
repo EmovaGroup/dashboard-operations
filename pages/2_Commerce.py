@@ -1,30 +1,11 @@
 # pages/2_Commerce.py
 # -----------------------------------------------------------------------------
 # COMMERCE — Dashboard (A vs B)
-#
-# ✅ Aligné “Global-like” MAIS avec correction :
-# - ✅ Parc A et parc B séparés (mags_cte_sql_A / mags_cte_sql_B)
-#   => évite le bug “Nb magasins identique” (ex: Tulipe 2025 vs 2026)
-#
-# ✅ Ajouts demandés :
-# - Export CSV tout en bas : toutes les données affichées
-#
-# ✅ Tulipe (2025 / 2026) :
-# - Branché sur tes MV :
-#   - public.mv_tulipe_2025_periode_op_magasin
-#   - public.mv_tulipe_2026_periode_op_magasin
-#   - public.mv_tulipe_2025_poids_op_periode_op_magasin
-#   - public.mv_tulipe_2026_poids_op_periode_op_magasin
-#
-# ✅ Modifs KPI demandées :
-# - Afficher les formules entre parenthèses
-# - Ajouter “Prix moyen article” = CA total / Nb articles vendus
-# - 3 lignes de 4 KPI
-# - “Nb magasins sélectionnés” tout à droite dans la 3ème ligne
-#
-# ✅ Ajout :
-# - Top 10 meilleurs magasins (perf) + Top 10 pires magasins (perf)
-#   (perf = variation CA % : (CA A - CA B) / CA B * 100)
+# ✅ Comparable / Non comparable / Tous appliqué partout
+# ✅ Spinners custom partout ("Données en cours de chargement… merci de patienter.")
+# ✅ FIX TIMEOUT : on calcule les magasins (mags) UNE SEULE FOIS -> puis ANY(%s)
+# ✅ FIX CARTE : plus de hovertemplate basé sur customdata (erreur "customdata not defined")
+# ✅ Tables “plus marketing” : € + % + intitulés plus propres
 # -----------------------------------------------------------------------------
 
 import io
@@ -37,7 +18,7 @@ import requests
 from src.auth import require_auth
 from src.ui import top_bar, tabs_nav
 from src.db import read_df
-from src.filters import render_filters
+from src.filters import render_filters, fetch_selected_mags
 from src.components import inject_kpi_compare_css, kpi_card_compare, fmt_money, fmt_int
 
 
@@ -50,8 +31,6 @@ OP_MV_PERIODE = {
     "noel_2024": "public.mv_noel_2024_periode_op_magasin",
     "anniversaire_2025": "public.mv_anniversaire_2025_periode_op_magasin",
     "anniversaire_2024": "public.mv_anniversaire_2024_periode_op_magasin",
-
-    # ✅ Tulipe
     "tulipe_2026": "public.mv_tulipe_2026_periode_op_magasin",
     "tulipe_2025": "public.mv_tulipe_2025_periode_op_magasin",
 }
@@ -62,8 +41,6 @@ OP_MV_POIDS = {
     "noel_2024": "public.mv_noel_2024_poids_op_periode_op_magasin",
     "anniversaire_2025": "public.mv_anniversaire_2025_poids_op_periode_op_magasin",
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
-
-    # ✅ Tulipe
     "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
     "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
 }
@@ -72,6 +49,8 @@ OP_MV_POIDS = {
 # =============================================================================
 # HELPERS
 # =============================================================================
+SPINNER_TXT = "Données en cours de chargement… merci de patienter."
+
 def _safe_float(x) -> float:
     try:
         return float(x or 0)
@@ -79,7 +58,17 @@ def _safe_float(x) -> float:
         return 0.0
 
 
-@st.cache_data(ttl=3600)
+def _fmt_pct(x, decimals=1) -> str:
+    try:
+        v = float(x)
+        if np.isnan(v):
+            return ""
+        return f"{v:.{decimals}f} %"
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_france_regions_geojson():
     url = "https://france-geojson.gregoiredavid.fr/repo/regions.geojson"
     r = requests.get(url, timeout=8)
@@ -87,12 +76,23 @@ def load_france_regions_geojson():
     return r.json()
 
 
-def plot_regions_plotly(df_region: pd.DataFrame, geojson: dict):
+def plot_regions_plotly(df_region: pd.DataFrame, geojson: dict, label_A: str, label_B: str):
+    """
+    IMPORTANT:
+    - Ne PAS utiliser %{customdata[...]}, car customdata n’est pas défini par défaut sur px.choropleth
+    - On laisse hover_data faire le boulot (stable)
+    """
+    if df_region is None or df_region.empty:
+        fig = px.choropleth()
+        fig.update_layout(height=520)
+        return fig
+
     if df_region["variation_CA"].notna().sum() >= 2:
         q5, q95 = np.nanpercentile(df_region["variation_CA"].dropna(), [5, 95])
     else:
         q5, q95 = -30, 30
 
+    # ✅ hover stable
     fig = px.choropleth(
         df_region,
         geojson=geojson,
@@ -101,21 +101,20 @@ def plot_regions_plotly(df_region: pd.DataFrame, geojson: dict):
         color="variation_CA",
         color_continuous_scale=["#d73027", "#fdae61", "#ffffbf", "#a6d96a", "#1a9850"],
         range_color=[q5, q95],
-        hover_data={"ca_A": True, "ca_B": True, "variation_CA": True},
-        labels={"variation_CA": "Δ CA (A vs B) (%)", "ca_A": "CA A (€)", "ca_B": "CA B (€)"},
+        hover_name="region_admin",
+        hover_data={
+            "ca_A": ":,.0f",
+            "ca_B": ":,.0f",
+            "variation_CA": ":.1f",
+            "region_admin": False,
+        },
+        labels={
+            "variation_CA": "Δ CA (A vs B) (%)",
+            "ca_A": f"CA {label_A} (€)",
+            "ca_B": f"CA {label_B} (€)",
+        },
     )
 
-    fig.update_traces(
-        hovertemplate=(
-            "<div style='background-color:#f5f5f5; padding:8px 10px; border-radius:8px; "
-            "border:1px solid #ddd; color:#111; font-size:13px;'>"
-            "<b>%{location}</b><br>"
-            "CA A = %{customdata[0]:,.0f} €<br>"
-            "CA B = %{customdata[1]:,.0f} €<br>"
-            "Variation (A vs B) = %{customdata[2]:+.1f} %"
-            "</div><extra></extra>"
-        )
-    )
     fig.update_geos(fitbounds="locations", visible=False)
     fig.update_layout(
         height=520,
@@ -126,15 +125,7 @@ def plot_regions_plotly(df_region: pd.DataFrame, geojson: dict):
     return fig
 
 
-def _superposed_line_by_dayindex(
-    dfA: pd.DataFrame,
-    dfB: pd.DataFrame,
-    y_col: str,
-    title: str,
-    y_label: str,
-    label_A: str,
-    label_B: str,
-):
+def _superposed_line_by_dayindex(dfA, dfB, y_col, title, y_label, label_A, label_B):
     if dfA is None:
         dfA = pd.DataFrame(columns=["day_index", y_col])
     if dfB is None:
@@ -202,48 +193,98 @@ def _plot_poids_bar(poidsA: dict, poidsB: dict, label_A: str, label_B: str):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _apply_comparable_scope_to_store_dfs(dfA_store: pd.DataFrame, dfB_store: pd.DataFrame, comparable_choice: str):
+    comparable_choice = (comparable_choice or "Tous").upper()
+
+    A_codes = set(dfA_store["code_magasin"].astype(str).str.strip().str.upper().tolist()) if not dfA_store.empty else set()
+    B_codes = set(dfB_store["code_magasin"].astype(str).str.strip().str.upper().tolist()) if not dfB_store.empty else set()
+
+    inter = A_codes.intersection(B_codes)
+    symdiff = A_codes.symmetric_difference(B_codes)
+
+    if comparable_choice == "C":
+        dfA_store = dfA_store[dfA_store["code_magasin"].isin(list(inter))].copy()
+        dfB_store = dfB_store[dfB_store["code_magasin"].isin(list(inter))].copy()
+    elif comparable_choice == "NC":
+        dfA_store = dfA_store[dfA_store["code_magasin"].isin(list(symdiff))].copy()
+        dfB_store = dfB_store[dfB_store["code_magasin"].isin(list(symdiff))].copy()
+
+    return dfA_store, dfB_store
+
+
+def _prettify_store_perf(df: pd.DataFrame, libA: str, libB: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    out = out.rename(
+        columns={
+            "code_magasin": "Code magasin",
+            "region_admin": "Région (admin)",
+            "ca_A": f"CA {libA} (€)",
+            "ca_B": f"CA {libB} (€)",
+            "variation_CA_pct": "Δ CA (A vs B) (%)",
+        }
+    )
+
+    if f"CA {libA} (€)" in out.columns:
+        out[f"CA {libA} (€)"] = out[f"CA {libA} (€)"].apply(lambda x: fmt_money(x, 0))
+    if f"CA {libB} (€)" in out.columns:
+        out[f"CA {libB} (€)"] = out[f"CA {libB} (€)"].apply(lambda x: fmt_money(x, 0))
+    if "Δ CA (A vs B) (%)" in out.columns:
+        out["Δ CA (A vs B) (%)"] = out["Δ CA (A vs B) (%)"].apply(lambda x: _fmt_pct(x, 1))
+
+    return out
+
+
+def _prettify_region_table(df_region: pd.DataFrame, libA: str, libB: str) -> pd.DataFrame:
+    if df_region is None or df_region.empty:
+        return df_region
+
+    out = df_region.copy()
+    out = out.rename(
+        columns={
+            "region_admin": "Région (admin)",
+            "ca_A": f"CA {libA} (€)",
+            "tickets_A": f"Tickets {libA}",
+            "ca_B": f"CA {libB} (€)",
+            "variation_CA": "Δ CA (A vs B) (%)",
+        }
+    )
+
+    if f"CA {libA} (€)" in out.columns:
+        out[f"CA {libA} (€)"] = out[f"CA {libA} (€)"].apply(lambda x: fmt_money(x, 0))
+    if f"CA {libB} (€)" in out.columns:
+        out[f"CA {libB} (€)"] = out[f"CA {libB} (€)"].apply(lambda x: fmt_money(x, 0))
+    if f"Tickets {libA}" in out.columns:
+        out[f"Tickets {libA}"] = out[f"Tickets {libA}"].apply(lambda x: fmt_int(x))
+    if "Δ CA (A vs B) (%)" in out.columns:
+        out["Δ CA (A vs B) (%)"] = out["Δ CA (A vs B) (%)"].apply(lambda x: _fmt_pct(x, 1))
+
+    return out
+
+
 # =============================================================================
-# LOADERS (parc A/B)
+# LOADERS (FAST) — base ANY(%s) sur liste magasins
 # =============================================================================
-@st.cache_data(ttl=600)
-def count_selected_mags(mags_cte_sql_: str, mags_cte_params_: tuple) -> int:
-    sql = f"""
-{mags_cte_sql_}
-select count(*)::int as nb_mag
-from mags;
-"""
-    df = read_df(sql, mags_cte_params_)
-    if df.empty:
-        return 0
-    return int(df.iloc[0]["nb_mag"] or 0)
+@st.cache_data(ttl=600, show_spinner=False)
+def load_totaux_commerce_from_codes(codes: list[str], date_debut: str, date_fin: str) -> dict:
+    if not codes:
+        return {"ca_total": 0.0, "tickets_total": 0.0, "articles_total": 0.0, "panier_moyen": 0.0, "indice_vente": 0.0}
 
-
-@st.cache_data(ttl=600)
-def load_totaux_commerce(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> dict:
-    sql = f"""
-{mags_cte_sql_},
-
-base as (
-  select
-    trim(st.code_magasin::text) as code_magasin,
-    st.ticket_date,
-    coalesce(st.nb_tickets, 0)::numeric as nb_tickets,
-    coalesce(st.qte_article, 0)::numeric as qte_article,
-    coalesce(st.total_ttc_net, 0)::numeric as ca_ttc_net
-  from public.vw_gold_tickets_jour_clean_op st
-  join mags m on m.code_magasin = trim(st.code_magasin::text)
-  where st.ticket_date >= %s::date
-    and st.ticket_date <= %s::date
-)
+    sql = """
 select
-  round(coalesce(sum(ca_ttc_net),0), 2) as ca_total,
-  round(coalesce(sum(nb_tickets),0), 0) as tickets_total,
-  round(coalesce(sum(qte_article),0), 0) as articles_total,
-  round(coalesce(sum(ca_ttc_net),0) / nullif(coalesce(sum(nb_tickets),0),0), 2) as panier_moyen,
-  round(coalesce(sum(qte_article),0) / nullif(coalesce(sum(nb_tickets),0),0), 2) as indice_vente
-from base;
+  round(coalesce(sum(st.total_ttc_net),0), 2) as ca_total,
+  round(coalesce(sum(st.nb_tickets),0), 0) as tickets_total,
+  round(coalesce(sum(st.qte_article),0), 0) as articles_total,
+  round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as panier_moyen,
+  round(coalesce(sum(st.qte_article),0) / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as indice_vente
+from public.vw_gold_tickets_jour_clean_op st
+where st.ticket_date >= %s::date
+  and st.ticket_date <= %s::date
+  and upper(trim(st.code_magasin::text)) = any(%s);
 """
-    df = read_df(sql, tuple(list(mags_cte_params_) + [date_debut, date_fin]))
+    df = read_df(sql, (date_debut, date_fin, codes))
     if df.empty:
         return {"ca_total": 0.0, "tickets_total": 0.0, "articles_total": 0.0, "panier_moyen": 0.0, "indice_vente": 0.0}
 
@@ -257,86 +298,32 @@ from base;
     }
 
 
-@st.cache_data(ttl=600)
-def load_op_totaux_depuis_mv_periode(mags_cte_sql_: str, mags_cte_params_: tuple, mv_periode: str) -> dict:
-    sql = f"""
-{mags_cte_sql_},
+@st.cache_data(ttl=600, show_spinner=False)
+def load_store_totals_for_map_from_codes(codes: list[str], date_debut: str, date_fin: str) -> pd.DataFrame:
+    if not codes:
+        return pd.DataFrame(columns=["code_magasin", "ca", "tickets"])
 
-op as (
-  select
-    trim(code_magasin::text) as code_magasin,
-    coalesce(total_ttc_net, 0)::numeric as ca_op,
-    coalesce(quantite_totale, 0)::numeric as qte_op,
-    coalesce(nb_tickets, 0)::numeric as tickets_op
-  from {mv_periode}
-),
-op_m as (
-  select o.* from op o join mags m using(code_magasin)
-)
+    sql = """
 select
-  round(coalesce(sum(ca_op),0), 2) as ca_op_total,
-  round(coalesce(sum(qte_op),0), 0) as qte_op_total,
-  round(coalesce(sum(tickets_op),0), 0) as tickets_op_total
-from op_m;
+  upper(trim(st.code_magasin::text)) as code_magasin,
+  coalesce(sum(st.total_ttc_net),0)::numeric as ca,
+  coalesce(sum(st.nb_tickets),0)::numeric as tickets
+from public.vw_gold_tickets_jour_clean_op st
+where st.ticket_date >= %s::date
+  and st.ticket_date <= %s::date
+  and upper(trim(st.code_magasin::text)) = any(%s)
+group by 1;
 """
-    df = read_df(sql, mags_cte_params_)
-    if df.empty:
-        return {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
-
-    r = df.iloc[0].to_dict()
-    return {
-        "ca_op_total": _safe_float(r.get("ca_op_total")),
-        "qte_op_total": _safe_float(r.get("qte_op_total")),
-        "tickets_op_total": _safe_float(r.get("tickets_op_total")),
-    }
+    return read_df(sql, (date_debut, date_fin, codes))
 
 
-@st.cache_data(ttl=600)
-def load_poids_op_global_depuis_mv_poids(mags_cte_sql_: str, mags_cte_params_: tuple, mv_poids: str) -> dict:
-    sql = f"""
-{mags_cte_sql_},
+@st.cache_data(ttl=600, show_spinner=False)
+def load_series_jour_relative_from_codes(codes: list[str], date_debut: str, date_fin: str) -> pd.DataFrame:
+    if not codes:
+        return pd.DataFrame(columns=["day_index", "ticket_date", "ca_ttc_net", "nb_tickets", "qte_article", "panier_moyen", "indice_vente"])
 
-p as (
-  select
-    trim(code_magasin::text) as code_magasin,
-    coalesce(ca_op, 0)::numeric as ca_op,
-    coalesce(qte_op, 0)::numeric as qte_op,
-    coalesce(ca_total_magasin, 0)::numeric as ca_total_magasin,
-    coalesce(qte_total_magasin, 0)::numeric as qte_total_magasin
-  from {mv_poids}
-),
-p_m as (
-  select p.* from p join mags m using(code_magasin)
-)
-select
-  round(coalesce(sum(ca_op),0), 2) as ca_op_sum,
-  round(coalesce(sum(ca_total_magasin),0), 2) as ca_tot_sum,
-  round(coalesce(sum(qte_op),0), 0) as qte_op_sum,
-  round(coalesce(sum(qte_total_magasin),0), 0) as qte_tot_sum
-from p_m;
-"""
-    df = read_df(sql, mags_cte_params_)
-    if df.empty:
-        return {"poids_ca": 0.0, "poids_volume": 0.0}
-
-    r = df.iloc[0].to_dict()
-    ca_op = _safe_float(r.get("ca_op_sum"))
-    ca_tot = _safe_float(r.get("ca_tot_sum"))
-    qte_op = _safe_float(r.get("qte_op_sum"))
-    qte_tot = _safe_float(r.get("qte_tot_sum"))
-
-    return {
-        "poids_ca": 0.0 if ca_tot == 0 else ca_op / ca_tot,
-        "poids_volume": 0.0 if qte_tot == 0 else qte_op / qte_tot,
-    }
-
-
-@st.cache_data(ttl=600)
-def load_series_jour_relative(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> pd.DataFrame:
-    sql = f"""
-{mags_cte_sql_},
-
-base as (
+    sql = """
+with base as (
   select
     st.ticket_date,
     ((st.ticket_date - %s::date) + 1)::int as day_index,
@@ -344,9 +331,9 @@ base as (
     coalesce(sum(st.qte_article),0)::numeric as qte_article,
     coalesce(sum(st.total_ttc_net),0)::numeric as ca_ttc_net
   from public.vw_gold_tickets_jour_clean_op st
-  join mags m on m.code_magasin = trim(st.code_magasin::text)
   where st.ticket_date >= %s::date
     and st.ticket_date <= %s::date
+    and upper(trim(st.code_magasin::text)) = any(%s)
   group by st.ticket_date, day_index
 )
 select
@@ -360,42 +347,76 @@ select
 from base
 order by day_index;
 """
-    params = tuple(list(mags_cte_params_) + [date_debut, date_debut, date_fin])
-    return read_df(sql, params)
+    return read_df(sql, (date_debut, date_debut, date_fin, codes))
 
 
-@st.cache_data(ttl=600)
-def load_store_totals_for_map(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> pd.DataFrame:
-    sql = f"""
-{mags_cte_sql_},
+@st.cache_data(ttl=600, show_spinner=False)
+def load_mag_regions_from_codes(codes: list[str]) -> pd.DataFrame:
+    if not codes:
+        return pd.DataFrame(columns=["code_magasin", "region_admin"])
 
-base as (
-  select
-    trim(st.code_magasin::text) as code_magasin,
-    coalesce(sum(st.total_ttc_net),0)::numeric as ca,
-    coalesce(sum(st.nb_tickets),0)::numeric as tickets
-  from public.vw_gold_tickets_jour_clean_op st
-  join mags m on m.code_magasin = trim(st.code_magasin::text)
-  where st.ticket_date >= %s::date
-    and st.ticket_date <= %s::date
-  group by trim(st.code_magasin::text)
-)
-select * from base;
-"""
-    return read_df(sql, tuple(list(mags_cte_params_) + [date_debut, date_fin]))
-
-
-@st.cache_data(ttl=600)
-def load_mag_regions(mags_cte_sql_: str, mags_cte_params_: tuple) -> pd.DataFrame:
-    sql = f"""
-{mags_cte_sql_}
+    sql = """
 select
-  m.code_magasin,
+  upper(trim(rm.code_magasin::text)) as code_magasin,
   coalesce(rm."crp_:_region_nationale_d_affectation", 'Non renseigné') as region_admin
-from mags m
-left join public.ref_magasin rm on trim(rm.code_magasin::text) = m.code_magasin;
+from public.ref_magasin rm
+where upper(trim(rm.code_magasin::text)) = any(%s);
 """
-    return read_df(sql, mags_cte_params_)
+    return read_df(sql, (codes,))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_op_totaux_depuis_mv_periode_codes(codes: list[str], mv_periode: str) -> dict:
+    if not codes:
+        return {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
+
+    sql = f"""
+select
+  round(coalesce(sum(coalesce(total_ttc_net,0)),0), 2) as ca_op_total,
+  round(coalesce(sum(coalesce(quantite_totale,0)),0), 0) as qte_op_total,
+  round(coalesce(sum(coalesce(nb_tickets,0)),0), 0) as tickets_op_total
+from {mv_periode}
+where upper(trim(code_magasin::text)) = any(%s);
+"""
+    df = read_df(sql, (codes,))
+    if df.empty:
+        return {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
+    r = df.iloc[0].to_dict()
+    return {
+        "ca_op_total": _safe_float(r.get("ca_op_total")),
+        "qte_op_total": _safe_float(r.get("qte_op_total")),
+        "tickets_op_total": _safe_float(r.get("tickets_op_total")),
+    }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_poids_op_global_depuis_mv_poids_codes(codes: list[str], mv_poids: str) -> dict:
+    if not codes:
+        return {"poids_ca": 0.0, "poids_volume": 0.0}
+
+    sql = f"""
+select
+  round(coalesce(sum(coalesce(ca_op,0)),0), 2) as ca_op_sum,
+  round(coalesce(sum(coalesce(ca_total_magasin,0)),0), 2) as ca_tot_sum,
+  round(coalesce(sum(coalesce(qte_op,0)),0), 0) as qte_op_sum,
+  round(coalesce(sum(coalesce(qte_total_magasin,0)),0), 0) as qte_tot_sum
+from {mv_poids}
+where upper(trim(code_magasin::text)) = any(%s);
+"""
+    df = read_df(sql, (codes,))
+    if df.empty:
+        return {"poids_ca": 0.0, "poids_volume": 0.0}
+
+    r = df.iloc[0].to_dict()
+    ca_op = _safe_float(r.get("ca_op_sum"))
+    ca_tot = _safe_float(r.get("ca_tot_sum"))
+    qte_op = _safe_float(r.get("qte_op_sum"))
+    qte_tot = _safe_float(r.get("qte_tot_sum"))
+
+    return {
+        "poids_ca": 0.0 if ca_tot == 0 else ca_op / ca_tot,
+        "poids_volume": 0.0 if qte_tot == 0 else qte_op / qte_tot,
+    }
 
 
 # =============================================================================
@@ -418,18 +439,18 @@ st.divider()
 inject_kpi_compare_css()
 
 ctx = render_filters()
+comparable_choice = ctx.get("comparable", "Tous")
 
-code_opA = ctx["opA"]["code"]
 lib_opA = ctx["opA"]["lib"]
 dateA0 = str(ctx["opA"]["date_debut"])
 dateA1 = str(ctx["opA"]["date_fin"])
+code_opA = ctx["opA"]["code"]
 
-code_opB = ctx["opB"]["code"]
 lib_opB = ctx["opB"]["lib"]
 dateB0 = str(ctx["opB"]["date_debut"])
 dateB1 = str(ctx["opB"]["date_fin"])
+code_opB = ctx["opB"]["code"]
 
-# ✅ CORRECTION : parc A et parc B séparés
 mags_cte_sql_A = ctx["mags_cte_sql_A"]
 mags_cte_params_A = ctx["mags_cte_params_A"]
 mags_cte_sql_B = ctx["mags_cte_sql_B"]
@@ -440,28 +461,34 @@ mvB_periode = OP_MV_PERIODE.get(code_opB)
 mvA_poids = OP_MV_POIDS.get(code_opA)
 mvB_poids = OP_MV_POIDS.get(code_opB)
 
-# ✅ nb magasins sélectionnés (parc A vs parc B)
-nb_mag_selected_A = count_selected_mags(mags_cte_sql_A, mags_cte_params_A)
-nb_mag_selected_B = count_selected_mags(mags_cte_sql_B, mags_cte_params_B)
+# ✅ FIX TIMEOUT : on récupère UNE fois la liste magasins A/B
+with st.spinner(SPINNER_TXT):
+    magsA_codes = fetch_selected_mags(mags_cte_sql_A, mags_cte_params_A)
+    magsB_codes = fetch_selected_mags(mags_cte_sql_B, mags_cte_params_B)
 
-st.markdown("## 🛒 Commerce — KPI (A vs B)")
-st.caption(f"Magasins sélectionnés (parc) : **{nb_mag_selected_A}** vs **{nb_mag_selected_B}**")
+nb_mag_selected_A = len(magsA_codes)
+nb_mag_selected_B = len(magsB_codes)
+
+st.markdown("## 🧩 Commerce — KPI (A vs B)")
+st.caption(f"Magasins sélectionnés (parc + filtres) : **{nb_mag_selected_A}** vs **{nb_mag_selected_B}**")
 st.divider()
 
-# ✅ totaux A / B (chacun sur son parc)
-totA = load_totaux_commerce(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
-totB = load_totaux_commerce(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
+with st.spinner(SPINNER_TXT):
+    totA = load_totaux_commerce_from_codes(magsA_codes, dateA0, dateA1)
+    totB = load_totaux_commerce_from_codes(magsB_codes, dateB0, dateB1)
 
 opA = {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
 opB = {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
 
 if mvA_periode:
-    opA = load_op_totaux_depuis_mv_periode(mags_cte_sql_A, mags_cte_params_A, mvA_periode)
+    with st.spinner(SPINNER_TXT):
+        opA = load_op_totaux_depuis_mv_periode_codes(magsA_codes, mvA_periode)
 else:
     st.warning(f"MV période OP manquante pour {code_opA}. Ajoute-la dans OP_MV_PERIODE.")
 
 if mvB_periode:
-    opB = load_op_totaux_depuis_mv_periode(mags_cte_sql_B, mags_cte_params_B, mvB_periode)
+    with st.spinner(SPINNER_TXT):
+        opB = load_op_totaux_depuis_mv_periode_codes(magsB_codes, mvB_periode)
 else:
     st.warning(f"MV période OP manquante pour {code_opB}. Ajoute-la dans OP_MV_PERIODE.")
 
@@ -469,118 +496,104 @@ poidsA = {"poids_ca": 0.0, "poids_volume": 0.0}
 poidsB = {"poids_ca": 0.0, "poids_volume": 0.0}
 
 if mvA_poids:
-    poidsA = load_poids_op_global_depuis_mv_poids(mags_cte_sql_A, mags_cte_params_A, mvA_poids)
+    with st.spinner(SPINNER_TXT):
+        poidsA = load_poids_op_global_depuis_mv_poids_codes(magsA_codes, mvA_poids)
 else:
     st.warning(f"MV poids OP manquante pour {code_opA}. Ajoute-la dans OP_MV_POIDS.")
 
 if mvB_poids:
-    poidsB = load_poids_op_global_depuis_mv_poids(mags_cte_sql_B, mags_cte_params_B, mvB_poids)
+    with st.spinner(SPINNER_TXT):
+        poidsB = load_poids_op_global_depuis_mv_poids_codes(magsB_codes, mvB_poids)
 else:
     st.warning(f"MV poids OP manquante pour {code_opB}. Ajoute-la dans OP_MV_POIDS.")
 
-
 # =============================================================================
-# KPI — 3 lignes de 4 KPI (avec formules + prix moyen article)
+# KPI — 3 lignes de 4 KPI
 # =============================================================================
-KPI_CA = "CA total"
-KPI_TICKETS = "Tickets total"
-KPI_ARTICLES = "Nb articles vendus"
-KPI_PANIER = "Panier moyen (CA total / Tickets total)"
-
-KPI_INDICE = "Indice de vente (Nb articles / Tickets total)"
-KPI_PRIX_ART = "Prix moyen article (CA total / Nb articles vendus)"
-KPI_CA_OP = "CA produits OP"
-KPI_TICKETS_OP = "Tickets produits OP"
-
-KPI_ARTICLES_OP = "Nb articles OP vendus"
-KPI_POIDS_CA = "Poids OP valeur (CA OP / CA total magasin)"
-KPI_POIDS_VOL = "Poids OP volume (Qte OP / Qte total magasin)"
-KPI_NB_MAG = "Nb magasins sélectionnés"
-
-# Prix moyen article = CA total / Nb articles vendus
 pma_A = 0.0 if float(totA["articles_total"] or 0) == 0 else float(totA["ca_total"] or 0) / float(totA["articles_total"] or 1)
 pma_B = 0.0 if float(totB["articles_total"] or 0) == 0 else float(totB["ca_total"] or 0) / float(totB["articles_total"] or 1)
 
-# Ligne 1 (4)
 r1 = st.columns(4)
 with r1[0]:
-    kpi_card_compare(KPI_CA, totA["ca_total"], totB["ca_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare("CA total (€)", totA["ca_total"], totB["ca_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
 with r1[1]:
-    kpi_card_compare(KPI_TICKETS, totA["tickets_total"], totB["tickets_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Tickets total", totA["tickets_total"], totB["tickets_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 with r1[2]:
-    kpi_card_compare(KPI_ARTICLES, totA["articles_total"], totB["articles_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Articles vendus", totA["articles_total"], totB["articles_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 with r1[3]:
-    kpi_card_compare(KPI_PANIER, totA["panier_moyen"], totB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+    kpi_card_compare("Panier moyen (€)", totA["panier_moyen"], totB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
 
-# Ligne 2 (4)
 r2 = st.columns(4)
 with r2[0]:
-    kpi_card_compare(KPI_INDICE, totA["indice_vente"], totB["indice_vente"], lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f}")
+    kpi_card_compare("Indice de vente (articles/ticket)", totA["indice_vente"], totB["indice_vente"], lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f}")
 with r2[1]:
-    kpi_card_compare(KPI_PRIX_ART, pma_A, pma_B, lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+    kpi_card_compare("Prix moyen article (€)", pma_A, pma_B, lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
 with r2[2]:
-    kpi_card_compare(KPI_CA_OP, opA["ca_op_total"], opB["ca_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare("CA produits OP (€)", opA["ca_op_total"], opB["ca_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
 with r2[3]:
-    kpi_card_compare(KPI_TICKETS_OP, opA["tickets_op_total"], opB["tickets_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Tickets produits OP", opA["tickets_op_total"], opB["tickets_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 
-# Ligne 3 (4) — Nb magasins sélectionnés tout à droite
 r3 = st.columns(4)
 with r3[0]:
-    kpi_card_compare(KPI_ARTICLES_OP, opA["qte_op_total"], opB["qte_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Articles OP vendus", opA["qte_op_total"], opB["qte_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 with r3[1]:
-    kpi_card_compare(KPI_POIDS_CA, poidsA["poids_ca"] * 100.0, poidsB["poids_ca"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
+    kpi_card_compare("Poids OP valeur (%)", poidsA["poids_ca"] * 100.0, poidsB["poids_ca"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
 with r3[2]:
-    kpi_card_compare(KPI_POIDS_VOL, poidsA["poids_volume"] * 100.0, poidsB["poids_volume"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
+    kpi_card_compare("Poids OP volume (%)", poidsA["poids_volume"] * 100.0, poidsB["poids_volume"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
 with r3[3]:
-    kpi_card_compare(KPI_NB_MAG, nb_mag_selected_A, nb_mag_selected_B, lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Nb magasins (parc)", nb_mag_selected_A, nb_mag_selected_B, lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
 
 st.divider()
 
 # =============================================================================
-# COURBES — SUPERPOSITION JOUR 1..N (parc A vs parc B)
+# COURBES — SUPERPOSITION JOUR 1..N
 # =============================================================================
-st.markdown("## 📈 Évolution jour — superposition (Jour 1..N)")
+st.markdown("## 📈 Évolution jour (Jour 1..N) — superposition A vs B")
 
-sA = load_series_jour_relative(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
-sB = load_series_jour_relative(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
+with st.spinner(SPINNER_TXT):
+    sA = load_series_jour_relative_from_codes(magsA_codes, dateA0, dateA1)
+    sB = load_series_jour_relative_from_codes(magsB_codes, dateB0, dateB1)
 
-_superposed_line_by_dayindex(sA, sB, "ca_ttc_net", "CA TTC net / jour — superposition A vs B", "CA (€)", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "nb_tickets", "Tickets / jour — superposition A vs B", "Tickets", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "qte_article", "Nb articles / jour — superposition A vs B", "Articles", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "panier_moyen", "Panier moyen / jour — superposition A vs B", "Panier moyen (€)", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "indice_vente", "Indice de vente / jour — superposition A vs B", "Articles / ticket", lib_opA, lib_opB)
+_superposed_line_by_dayindex(sA, sB, "ca_ttc_net", "CA TTC net / jour", "CA (€)", lib_opA, lib_opB)
+_superposed_line_by_dayindex(sA, sB, "nb_tickets", "Tickets / jour", "Tickets", lib_opA, lib_opB)
+_superposed_line_by_dayindex(sA, sB, "qte_article", "Articles / jour", "Articles", lib_opA, lib_opB)
+_superposed_line_by_dayindex(sA, sB, "panier_moyen", "Panier moyen / jour", "Panier moyen (€)", lib_opA, lib_opB)
+_superposed_line_by_dayindex(sA, sB, "indice_vente", "Indice de vente / jour", "Articles / ticket", lib_opA, lib_opB)
 
 st.divider()
 
 # =============================================================================
 # GRAPHE POIDS OP (période) — A vs B
 # =============================================================================
-st.markdown("## ⚖️ Poids de l’opération (période) — A vs B")
+st.markdown("## ⚖️ Poids de l’opération (période) — Valeur & Volume")
 _plot_poids_bar(poidsA, poidsB, lib_opA, lib_opB)
 
 st.divider()
 
 # =============================================================================
-# CARTE FRANCE PAR RÉGION ADMIN (A vs B) — variation CA (parc A/B)
+# CARTE FRANCE PAR RÉGION ADMIN — variation CA (A vs B)
 # =============================================================================
-st.subheader("🗺️ Carte des performances régionales – variation CA (A vs B)")
+st.subheader("🗺️ Carte des performances régionales — Δ CA (A vs B)")
 
-dfA_store = load_store_totals_for_map(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
-dfB_store = load_store_totals_for_map(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
+with st.spinner(SPINNER_TXT):
+    dfA_store = load_store_totals_for_map_from_codes(magsA_codes, dateA0, dateA1)
+    dfB_store = load_store_totals_for_map_from_codes(magsB_codes, dateB0, dateB1)
 
-# régions : on prend l’union des 2 parcs pour avoir le mapping région pour tous les codes
-df_mag_A = load_mag_regions(mags_cte_sql_A, mags_cte_params_A)
-df_mag_B = load_mag_regions(mags_cte_sql_B, mags_cte_params_B)
-df_mag = pd.concat([df_mag_A, df_mag_B], ignore_index=True).drop_duplicates(subset=["code_magasin"])
+    # sécurité comparable au niveau store
+    dfA_store, dfB_store = _apply_comparable_scope_to_store_dfs(dfA_store, dfB_store, comparable_choice)
+
+    # régions depuis ref_magasin (rapide)
+    codes_union = sorted(set(dfA_store["code_magasin"].astype(str).tolist()).union(set(dfB_store["code_magasin"].astype(str).tolist())))
+    df_mag = load_mag_regions_from_codes(codes_union)
 
 df_region_A = (
-    dfA_store.merge(df_mag[["code_magasin", "region_admin"]], on="code_magasin", how="left")
+    dfA_store.merge(df_mag, on="code_magasin", how="left")
     .groupby("region_admin", as_index=False)
     .agg(ca_A=("ca", "sum"), tickets_A=("tickets", "sum"))
 )
 
 df_region_B = (
-    dfB_store.merge(df_mag[["code_magasin", "region_admin"]], on="code_magasin", how="left")
+    dfB_store.merge(df_mag, on="code_magasin", how="left")
     .groupby("region_admin", as_index=False)
     .agg(ca_B=("ca", "sum"))
 )
@@ -593,34 +606,34 @@ df_region["variation_CA"] = np.where(
 )
 
 try:
-    geojson = load_france_regions_geojson()
-    fig_map_regions = plot_regions_plotly(df_region, geojson)
+    with st.spinner(SPINNER_TXT):
+        geojson = load_france_regions_geojson()
+    fig_map_regions = plot_regions_plotly(df_region, geojson, lib_opA, lib_opB)
     st.plotly_chart(fig_map_regions, use_container_width=True)
-    st.caption("Vert = progression positive / Rouge = baisse. Survolez pour les valeurs.")
+    st.caption("Vert = progression / Rouge = baisse. Survolez pour le détail.")
 except Exception as e:
     st.warning(f"Impossible d'afficher la carte (GeoJSON): {e}")
-    show = df_region.copy()
-    show = show.rename(
-        columns={
-            "region_admin": "Région (admin)",
-            "ca_A": f"CA {lib_opA}",
-            "ca_B": f"CA {lib_opB}",
-            "tickets_A": f"Tickets {lib_opA}",
-            "variation_CA": "Variation CA (A vs B) %",
-        }
-    )
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.dataframe(_prettify_region_table(df_region, lib_opA, lib_opB), use_container_width=True, hide_index=True)
+
+with st.expander("📋 Détail par région (table)"):
+    st.dataframe(_prettify_region_table(df_region, lib_opA, lib_opB), use_container_width=True, hide_index=True)
 
 st.divider()
 
 # =============================================================================
 # TOP 10 magasins — meilleurs / pires perf (variation CA %)
 # =============================================================================
-st.subheader("🏪 Top magasins — meilleurs & pires perf (A vs B)")
+st.subheader("🏪 Top magasins — meilleurs & pires Δ CA (A vs B)")
+
+join_mode = "inner" if (comparable_choice or "Tous").upper() == "C" else "outer"
 
 df_store_perf = (
     dfA_store.rename(columns={"ca": "ca_A", "tickets": "tickets_A"})
-    .merge(dfB_store.rename(columns={"ca": "ca_B", "tickets": "tickets_B"}), on="code_magasin", how="outer")
+    .merge(
+        dfB_store.rename(columns={"ca": "ca_B", "tickets": "tickets_B"}),
+        on="code_magasin",
+        how=join_mode,
+    )
     .merge(df_mag, on="code_magasin", how="left")
     .fillna(0)
 )
@@ -635,23 +648,26 @@ df_store_perf["ca_A"] = df_store_perf["ca_A"].astype(float)
 df_store_perf["ca_B"] = df_store_perf["ca_B"].astype(float)
 df_store_perf["variation_CA_pct"] = df_store_perf["variation_CA_pct"].astype(float)
 
+df_store_perf = df_store_perf[~((df_store_perf["ca_A"] == 0) & (df_store_perf["ca_B"] == 0))].copy()
+df_valid = df_store_perf.dropna(subset=["variation_CA_pct"]).copy()
+
 cols_show = ["code_magasin", "region_admin", "ca_A", "ca_B", "variation_CA_pct"]
 
-df_best = df_store_perf.dropna(subset=["variation_CA_pct"]).sort_values("variation_CA_pct", ascending=False).head(10)[cols_show]
-df_worst = df_store_perf.dropna(subset=["variation_CA_pct"]).sort_values("variation_CA_pct", ascending=True).head(10)[cols_show]
+df_best = df_valid.sort_values("variation_CA_pct", ascending=False).head(10)[cols_show]
+df_worst = df_valid.sort_values("variation_CA_pct", ascending=True).head(10)[cols_show]
 
 c_top = st.columns(2)
 with c_top[0]:
-    st.markdown("### ✅ Top 10 meilleurs")
-    st.dataframe(df_best, use_container_width=True, hide_index=True)
+    st.markdown("### ✅ Top 10 (meilleurs)")
+    st.dataframe(_prettify_store_perf(df_best, lib_opA, lib_opB), use_container_width=True, hide_index=True)
 with c_top[1]:
-    st.markdown("### ❌ Top 10 pires")
-    st.dataframe(df_worst, use_container_width=True, hide_index=True)
+    st.markdown("### ❌ Top 10 (pires)")
+    st.dataframe(_prettify_store_perf(df_worst, lib_opA, lib_opB), use_container_width=True, hide_index=True)
 
 st.divider()
 
 # =============================================================================
-# EXPORT CSV (tout ce qui est affiché)
+# EXPORT CSV
 # =============================================================================
 st.markdown("## 📤 Export (CSV) — données affichées")
 
@@ -669,73 +685,43 @@ df_kpi_export = pd.DataFrame(
         {"bloc": "kpi", "kpi": "indice_vente", "op": "B", "value": totB["indice_vente"]},
         {"bloc": "kpi", "kpi": "prix_moyen_article", "op": "A", "value": pma_A},
         {"bloc": "kpi", "kpi": "prix_moyen_article", "op": "B", "value": pma_B},
-
         {"bloc": "kpi_op", "kpi": "ca_op_total", "op": "A", "value": opA["ca_op_total"]},
         {"bloc": "kpi_op", "kpi": "ca_op_total", "op": "B", "value": opB["ca_op_total"]},
         {"bloc": "kpi_op", "kpi": "tickets_op_total", "op": "A", "value": opA["tickets_op_total"]},
         {"bloc": "kpi_op", "kpi": "tickets_op_total", "op": "B", "value": opB["tickets_op_total"]},
         {"bloc": "kpi_op", "kpi": "qte_op_total", "op": "A", "value": opA["qte_op_total"]},
         {"bloc": "kpi_op", "kpi": "qte_op_total", "op": "B", "value": opB["qte_op_total"]},
-
         {"bloc": "poids", "kpi": "poids_ca", "op": "A", "value": poidsA["poids_ca"]},
         {"bloc": "poids", "kpi": "poids_ca", "op": "B", "value": poidsB["poids_ca"]},
         {"bloc": "poids", "kpi": "poids_volume", "op": "A", "value": poidsA["poids_volume"]},
         {"bloc": "poids", "kpi": "poids_volume", "op": "B", "value": poidsB["poids_volume"]},
-
         {"bloc": "parc", "kpi": "nb_mag_selected", "op": "A", "value": nb_mag_selected_A},
         {"bloc": "parc", "kpi": "nb_mag_selected", "op": "B", "value": nb_mag_selected_B},
+        {"bloc": "filtre", "kpi": "comparable", "op": "ALL", "value": comparable_choice},
     ]
 )
 
-df_series_export = pd.concat(
-    [
-        sA.assign(operation=lib_opA),
-        sB.assign(operation=lib_opB),
-    ],
-    ignore_index=True,
-)
+df_series_export = pd.concat([sA.assign(operation=lib_opA), sB.assign(operation=lib_opB)], ignore_index=True)
 
 df_region_export = df_region.copy()
 df_region_export["opA"] = lib_opA
 df_region_export["opB"] = lib_opB
+df_region_export["comparable"] = comparable_choice
 
 df_store_export = df_store_perf.copy()
 df_store_export["opA"] = lib_opA
 df_store_export["opB"] = lib_opB
+df_store_export["comparable"] = comparable_choice
 
 c_exp = st.columns(4)
 with c_exp[0]:
-    st.download_button(
-        "⬇️ KPI (CSV)",
-        data=_df_to_csv_bytes(df_kpi_export),
-        file_name="commerce_kpi.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+    st.download_button("⬇️ KPI (CSV)", data=_df_to_csv_bytes(df_kpi_export), file_name="commerce_kpi.csv", mime="text/csv", use_container_width=True)
 with c_exp[1]:
-    st.download_button(
-        "⬇️ Séries jour (CSV)",
-        data=_df_to_csv_bytes(df_series_export),
-        file_name="commerce_series_jour.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+    st.download_button("⬇️ Séries jour (CSV)", data=_df_to_csv_bytes(df_series_export), file_name="commerce_series_jour.csv", mime="text/csv", use_container_width=True)
 with c_exp[2]:
-    st.download_button(
-        "⬇️ Régions (CSV)",
-        data=_df_to_csv_bytes(df_region_export),
-        file_name="commerce_regions.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+    st.download_button("⬇️ Régions (CSV)", data=_df_to_csv_bytes(df_region_export), file_name="commerce_regions.csv", mime="text/csv", use_container_width=True)
 with c_exp[3]:
-    st.download_button(
-        "⬇️ Magasins (CSV)",
-        data=_df_to_csv_bytes(df_store_export),
-        file_name="commerce_magasins.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+    st.download_button("⬇️ Magasins (CSV)", data=_df_to_csv_bytes(df_store_export), file_name="commerce_magasins.csv", mime="text/csv", use_container_width=True)
 
 with st.expander("Voir les tables exportées"):
     st.markdown("### KPI")

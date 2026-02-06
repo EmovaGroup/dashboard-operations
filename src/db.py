@@ -12,6 +12,7 @@ def get_conn():
         user=st.secrets["DB_USER"],
         password=st.secrets["DB_PASSWORD"],
         sslmode="require",
+        options="-c statement_timeout=120000"  # 120s
     )
     try:
         yield conn

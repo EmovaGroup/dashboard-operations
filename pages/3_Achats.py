@@ -2,29 +2,9 @@
 # =============================================================================
 # PAGE : ACHATS (A vs B) — parcs séparés A/B + normalisation ancien_code -> code_magasin
 # =============================================================================
-# Objectif :
-# - Comparer 2 opérations (A vs B) sur les achats
-# - 2 modes :
-#   1) Mode magasin : si un code_magasin est sélectionné -> fiche magasin + KPI + table PUM
-#   2) Mode parc : sinon -> KPI parc + camemberts + table PUM
-#
-# Fix majeur filtres :
-# ✅ 2 parcs distincts :
-#    - mags_cte_sql_A / mags_cte_params_A  (parc pour l'opération A)
-#    - mags_cte_sql_B / mags_cte_params_B  (parc pour l'opération B)
-#
-# Fix majeur achats :
-# ✅ Normalisation du code magasin achats via vw_param_magasin_ancien_code :
-#    - code_magasin_canon = COALESCE(map.code_magasin, UPPER(TRIM(a.code_magasin)))
-#    => permet d’aligner N vs N-1 si le code a changé
-#
-# Parc Achats souhaité :
-# ✅ Base parc = mags (tickets période op depuis filters.py)
-# ✅ + ajouter les magasins qui ont acheté sur l’op (vw_op_achats_norm), même sans tickets
-# ✅ mais uniquement si le code canonique existe dans ref_magasin
-#
-# Bonus demandé “comme Marketing” :
-# ✅ Ajout au-dessus des KPI achats : CA total, Tickets total, Panier moyen (sur la période de l'op)
+# Optim perf (comme Marketing/Commerce) :
+# ✅ @st.cache_data(show_spinner=False) partout
+# ✅ spinner custom unique autour des blocs lourds
 # =============================================================================
 
 import streamlit as st
@@ -44,6 +24,8 @@ from src.components import (
     inject_store_css,
     store_card_3col_html,
 )
+
+SPINNER_TXT = "Données en cours de chargement… merci de patienter."
 
 # -----------------------------------------------------------------------------
 # Config page + auth
@@ -141,7 +123,7 @@ def build_color_map(labels: list[str]) -> dict:
 # =============================================================================
 # COMMERCE LIGHT — CA / Tickets / PM (sur la période)
 # =============================================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_commerce_light(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> dict:
     sql = f"""
 {mags_cte_sql_},
@@ -178,6 +160,7 @@ from base;
 # =============================================================================
 # FICHE MAGASIN
 # =============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
 def magasin_info_query(code_magasin: str) -> pd.Series:
     sql = """
     select
@@ -272,11 +255,6 @@ def render_magasin_fiche(code_magasin: str):
 # Helper SQL — normalisation code magasin achats (canon)
 # =============================================================================
 def _achats_norm_cte(code_op: str) -> tuple[str, list]:
-    """
-    Normalise a.code_magasin en code canonique :
-    - si a.code_magasin = ancien_code => remap vers code_magasin (nouveau)
-    - sinon => code_magasin lui-même (upper/trim)
-    """
     cte = f"""
 a_norm as (
   select
@@ -296,13 +274,6 @@ a_norm as (
 # HELPERS SQL PARC
 # =============================================================================
 def _parc_analysis_cte(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> tuple[str, tuple]:
-    """
-    Parc d'analyse Achats :
-    - Base = mags (tickets période op) déjà filtré par filters.py
-    - + ajouter les acheteurs OP (même si achats existent sans tickets)
-    - ✅ achats remappés via code_magasin_canon (ancien_code -> nouveau)
-    - ✅ on garde uniquement les codes canoniques présents dans ref_magasin
-    """
     achats_cte, achats_params = _achats_norm_cte(code_op)
 
     sql = f"""
@@ -329,21 +300,18 @@ parc_analysis as (
   select code_magasin from mags_acheteurs_op
 )
 """
-    # params: mags_cte_params_ + achats_params
     return sql, tuple(list(mags_cte_params_) + achats_params)
 
 
 # =============================================================================
-# Check data (message clair si rien)
+# Check data
 # =============================================================================
+@st.cache_data(ttl=600, show_spinner=False)
 def has_data_for_magasin(code_op: str, code_magasin: str) -> bool:
-    """
-    Vérifie si le magasin a au moins une ligne d'achat sur l'op
-    en tenant compte du remap ancien_code -> nouveau code (canon).
-    """
+    sql_cte, _ = _achats_norm_cte(code_op)
     sql = f"""
 with
-{_achats_norm_cte(code_op)[0]}
+{sql_cte}
 select 1
 from a_norm a
 where a.code_magasin_canon = upper(trim(%s::text))
@@ -353,6 +321,7 @@ limit 1;
     return not df.empty
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def has_data_for_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> bool:
     parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
     sql = f"""
@@ -377,10 +346,12 @@ def no_data_block(msg: str):
 # =============================================================================
 # MODE MAGASIN : KPI + table PUM
 # =============================================================================
+@st.cache_data(ttl=600, show_spinner=False)
 def achats_kpi_magasin(code_op: str, code_magasin: str) -> pd.Series:
+    sql_cte, _ = _achats_norm_cte(code_op)
     sql = f"""
 with
-{_achats_norm_cte(code_op)[0]}
+{sql_cte}
 select
   coalesce(sum(a."total achat"),0) as valeur_achats_captee,
   coalesce(sum(a.quantite),0) as volume_achats_capte,
@@ -394,10 +365,12 @@ where a.code_magasin_canon = upper(trim(%s::text));
     return df.iloc[0]
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def pum_par_fournisseur_magasin(code_op: str, code_magasin: str) -> pd.DataFrame:
+    sql_cte, _ = _achats_norm_cte(code_op)
     sql = f"""
 with
-{_achats_norm_cte(code_op)[0]}
+{sql_cte}
 select
   coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
   coalesce(sum(a.quantite),0) as qte,
@@ -414,13 +387,13 @@ order by valeur desc;
 # =============================================================================
 # MODE PARC : KPI + camemberts + table PUM
 # =============================================================================
+@st.cache_data(ttl=600, show_spinner=False)
 def achats_kpi_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.Series:
     parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
 
     sql = f"""
 {parc_sql},
 
--- achats captés par magasin (sur code canonique)
 achats_capt as (
   select
     a.code_magasin_canon as code_magasin,
@@ -464,6 +437,7 @@ from agg;
     return df.iloc[0]
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def camembert_fusion_magasin_parc(
     mags_cte_sql_: str,
     mags_cte_params_: tuple,
@@ -539,6 +513,7 @@ select fournisseur, nb_mag from autres_non_captes;
     return read_df(sql, params=parc_params)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def pum_par_fournisseur_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.DataFrame:
     parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
 
@@ -584,11 +559,12 @@ def render_pie_with_shared_palette(df: pd.DataFrame, all_labels: list[str], colo
 
 
 # =============================================================================
-# EN-TÊTE : KPI COMMERCE au-dessus (comme Marketing)
+# EN-TÊTE : KPI COMMERCE au-dessus
 # =============================================================================
 st.markdown("## 🧾 Contexte commerce (sur la période) — A vs B")
-cA = load_commerce_light(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
-cB = load_commerce_light(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
+with st.spinner(SPINNER_TXT):
+    cA = load_commerce_light(mags_cte_sql_A, mags_cte_params_A, dateA0, dateA1)
+    cB = load_commerce_light(mags_cte_sql_B, mags_cte_params_B, dateB0, dateB1)
 
 cc = st.columns(3)
 with cc[0]:
@@ -604,16 +580,18 @@ st.divider()
 # RENDER
 # =============================================================================
 if code_magasin_selected:
-    # --- check data magasin (sur OP A) ---
-    if not has_data_for_magasin(code_opA, code_magasin_selected):
-        no_data_block(f"Magasin **{code_magasin_selected}** : aucune ligne d’achat (remap inclus) sur **{lib_opA}**.")
+    with st.spinner(SPINNER_TXT):
+        if not has_data_for_magasin(code_opA, code_magasin_selected):
+            no_data_block(f"Magasin **{code_magasin_selected}** : aucune ligne d’achat (remap inclus) sur **{lib_opA}**.")
 
     st.markdown("## 🏬 Magasin sélectionné")
-    render_magasin_fiche(code_magasin_selected)
+    with st.spinner(SPINNER_TXT):
+        render_magasin_fiche(code_magasin_selected)
     st.divider()
 
-    kA = achats_kpi_magasin(code_opA, code_magasin_selected)
-    kB = achats_kpi_magasin(code_opB, code_magasin_selected)
+    with st.spinner(SPINNER_TXT):
+        kA = achats_kpi_magasin(code_opA, code_magasin_selected)
+        kB = achats_kpi_magasin(code_opB, code_magasin_selected)
 
     st.markdown("## 🧾 Achats – Synthèse (magasin)")
     c1, c2, c3 = st.columns(3)
@@ -653,8 +631,13 @@ if code_magasin_selected:
 
     top_n = st.slider("Top N fournisseurs (table PUM par valeur N)", min_value=3, max_value=30, value=12, step=1)
 
-    pumA = pum_par_fournisseur_magasin(code_opA, code_magasin_selected).rename(columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"})
-    pumB = pum_par_fournisseur_magasin(code_opB, code_magasin_selected).rename(columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"})
+    with st.spinner(SPINNER_TXT):
+        pumA = pum_par_fournisseur_magasin(code_opA, code_magasin_selected).rename(
+            columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
+        )
+        pumB = pum_par_fournisseur_magasin(code_opB, code_magasin_selected).rename(
+            columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
+        )
 
     merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
     merged = merged.sort_values("valeur_A", ascending=False).head(top_n)
@@ -680,12 +663,12 @@ if code_magasin_selected:
     )
 
 else:
-    # --- check parc (sur OP A, parc A) ---
-    if not has_data_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA):
-        no_data_block("Aucun magasin dans le parc (tickets + acheteurs remap) avec les filtres actuels.")
+    with st.spinner(SPINNER_TXT):
+        if not has_data_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA):
+            no_data_block("Aucun magasin dans le parc (tickets + acheteurs remap) avec les filtres actuels.")
 
-    kA = achats_kpi_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
-    kB = achats_kpi_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
+        kA = achats_kpi_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
+        kB = achats_kpi_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
     st.markdown("## 🧾 Achats – Synthèse")
 
@@ -743,8 +726,9 @@ else:
     st.markdown("## 🥧 Répartition des magasins selon le fournisseur d’achat")
     st.caption("Répartition en **nombre de magasins** : chaque magasin capté est affecté à son **fournisseur principal** (valeur d’achat max).")
 
-    dfA = camembert_fusion_magasin_parc(mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12)
-    dfB = camembert_fusion_magasin_parc(mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12)
+    with st.spinner(SPINNER_TXT):
+        dfA = camembert_fusion_magasin_parc(mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12)
+        dfB = camembert_fusion_magasin_parc(mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12)
 
     all_labels = sorted(set(dfA["fournisseur"].tolist()) | set(dfB["fournisseur"].tolist()))
     non_captes = "Autres fournisseurs (non captés)"
@@ -768,8 +752,13 @@ else:
 
     top_n = st.slider("Top N fournisseurs (table PUM par valeur A)", min_value=3, max_value=30, value=12, step=1)
 
-    pumA = pum_par_fournisseur_parc(mags_cte_sql_A, mags_cte_params_A, code_opA).rename(columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"})
-    pumB = pum_par_fournisseur_parc(mags_cte_sql_B, mags_cte_params_B, code_opB).rename(columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"})
+    with st.spinner(SPINNER_TXT):
+        pumA = pum_par_fournisseur_parc(mags_cte_sql_A, mags_cte_params_A, code_opA).rename(
+            columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
+        )
+        pumB = pum_par_fournisseur_parc(mags_cte_sql_B, mags_cte_params_B, code_opB).rename(
+            columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
+        )
 
     merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
     merged = merged.sort_values("valeur_A", ascending=False).head(top_n)

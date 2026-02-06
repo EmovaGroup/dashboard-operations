@@ -1,15 +1,26 @@
 # pages/1_Global.py
 # -----------------------------------------------------------------------------
-# GLOBAL — Dashboard (A vs B)
+# GLOBAL — Dashboard (A vs B) — VERSION OPTIMISÉE (comme Commerce)
 #
-# ✅ Logique corrigée :
-# - Parc A = ctx["mags_cte_sql_A"] + params_A
-# - Parc B = ctx["mags_cte_sql_B"] + params_B
-# - KPI calculés sur vw_gold_tickets_jour_clean_op sur la période de l’opération (vw_operations_dedup)
+# Objectif demandé :
+# - "On s'en fout actif/fermé" -> base = magasins ayant des ventes, point.
+# - On applique les filtres -> on obtient un parc de codes magasins A et B
+# - On calcule KPI via ANY(%s) (rapide) comme Commerce
 #
-# ✅ Fix IMPORTANT :
-# - Mode magasin : KPI calculés UNIQUEMENT sur ce magasin
-# - Mode parc : KPI A sur parc A, KPI B sur parc B (avant : bug => B compté sur parc A)
+# Fix IDF :
+# - On ne dépend plus de crp_region_nationale... (souvent vide/incohérent)
+# - IDF = CP département ∈ {75,77,78,91,92,93,94,95}
+# - PARIS = CP département = 75 (plus fiable que ville)
+#
+# Perf :
+# - fetch_selected_mags() 1 seule fois pour A/B
+# - ref_magasin chargé 1 seule fois sur union(codes A/B)
+# - scopes filtrés en Python
+# - KPI/Counts en SQL via ANY(%s)
+#
+# ✅ FIX COMPARABLE (codes canoniques) :
+# - Les codes "mags" sont canoniques, mais les ventes peuvent contenir l'ancien code
+# - Donc on canonise aussi st.code_magasin via vw_param_magasin_ancien_code dans TOUTES les requêtes ventes
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -18,6 +29,7 @@ import pandas as pd
 from src.auth import require_auth
 from src.ui import top_bar, tabs_nav
 from src.db import read_df
+from src.filters import render_filters, fetch_selected_mags
 from src.components import (
     inject_kpi_css,
     inject_kpi_compare_css,
@@ -26,9 +38,9 @@ from src.components import (
     fmt_int,
     inject_store_css,
     store_card_3col_html,
-    st_meteo_asset,
 )
-from src.filters import render_filters
+
+SPINNER_TXT = "Données en cours de chargement… merci de patienter."
 
 st.set_page_config(page_title="Global", layout="wide")
 require_auth()
@@ -48,449 +60,322 @@ ctx = render_filters()
 
 code_opA = ctx["opA"]["code"]
 lib_opA = ctx["opA"]["lib"]
+dateA0 = str(ctx["opA"]["date_debut"])
+dateA1 = str(ctx["opA"]["date_fin"])
+
 code_opB = ctx["opB"]["code"]
 lib_opB = ctx["opB"]["lib"]
+dateB0 = str(ctx["opB"]["date_debut"])
+dateB1 = str(ctx["opB"]["date_fin"])
 
-# ✅ FIX : parcs séparés A/B
 mags_cte_sql_A = ctx["mags_cte_sql_A"]
 mags_cte_params_A = ctx["mags_cte_params_A"]
 mags_cte_sql_B = ctx["mags_cte_sql_B"]
 mags_cte_params_B = ctx["mags_cte_params_B"]
 
 filters = ctx.get("filters", {})
-code_magasin_selected = filters.get("code_magasin")
+code_magasin_selected = (filters.get("code_magasin") or "").strip().upper() or None
 
 st.caption(
-    f"Année N : **{lib_opA}** ({ctx['opA']['date_debut']} → {ctx['opA']['date_fin']})  |  "
-    f"Année N-1 : **{lib_opB}** ({ctx['opB']['date_debut']} → {ctx['opB']['date_fin']})"
+    f"Année N : **{lib_opA}** ({dateA0} → {dateA1})  |  "
+    f"Année N-1 : **{lib_opB}** ({dateB0} → {dateB1})"
 )
 
 # =========================
-# Helpers schema (robuste colonnes)
+# Helpers
 # =========================
-@st.cache_data(ttl=3600)
-def table_columns(schema: str, table: str) -> set[str]:
-    df = read_df(
-        """
-        select column_name
-        from information_schema.columns
-        where table_schema = %s and table_name = %s
-        """,
-        params=(schema, table),
-    )
-    return set(df["column_name"].tolist()) if not df.empty else set()
+def _safe_float(x) -> float:
+    try:
+        return float(x or 0)
+    except Exception:
+        return 0.0
 
 
-def qident(col: str) -> str:
-    return '"' + col.replace('"', '""') + '"'
+def _norm_code_list(codes: list[str]) -> list[str]:
+    if not codes:
+        return []
+    out = []
+    for c in codes:
+        if c is None:
+            continue
+        s = str(c).strip().upper()
+        if s:
+            out.append(s)
+    return sorted(set(out))
 
 
-def pick_first(existing: set[str], candidates: list[str]) -> str | None:
-    for c in candidates:
-        if c in existing:
-            return c
-    return None
-
-
-def sel_or_null(col: str | None, alias: str, existing_cols: set[str]) -> str:
-    if not col or col not in existing_cols:
-        return f"null::text as {alias}"
-    return f"rm.{qident(col)} as {alias}"
-
-
-# =========================
-# CTE mags override pour MODE MAGASIN
-# =========================
-def mags_cte_for_store(code_magasin: str) -> tuple[str, tuple]:
-    sql = """
-WITH mags as (
-  select trim(%s::text) as code_magasin
-)
-""".strip()
-    return sql, (code_magasin,)
-
-
-# =========================
-# Scopes (Tous / Paris / IDF / Province)
-# =========================
-def _scope_clause_and_params(scope: str):
-    if scope == "PARIS":
-        return "coalesce(rm.ville,'') ilike %s", ["paris%"]
-
-    if scope == "IDF":
-        return """
-        (
-          coalesce(rm."crp_:_region_nationale_d_affectation",'') ilike %s
-          OR coalesce(rm."crp_:_region_nationale_d_affectation",'') ilike %s
-        )
-        """, ["%ile%france%", "%île%france%"]
-
-    if scope == "PROVINCE":
-        return """
-        NOT (coalesce(rm.ville,'') ilike %s)
-        AND NOT (
-          coalesce(rm."crp_:_region_nationale_d_affectation",'') ilike %s
-          OR coalesce(rm."crp_:_region_nationale_d_affectation",'') ilike %s
-        )
-        """, ["paris%", "%ile%france%", "%île%france%"]
-
-    return "1=1", []
-
-
-# =========================
-# KPI query (agrégé période) — vw_operations_dedup
-# =========================
-def kpi_query(code_op: str, scope: str, mags_sql: str, mags_params: tuple) -> pd.DataFrame:
-    scope_sql, scope_params = _scope_clause_and_params(scope)
-
-    sql = f"""
-{mags_sql},
-op as (
-  select date_debut, date_fin
-  from public.vw_operations_dedup
-  where code_operation = %s
-  limit 1
-)
-select
-  coalesce(sum(st.total_ttc_net),0) as ca,
-  coalesce(sum(st.nb_tickets),0) as tickets,
-  coalesce(sum(st.qte_article),0) as qte_articles,
-  round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as panier_moyen,
-  round(coalesce(sum(st.qte_article),0)::numeric / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as indice_vente,
-  round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.qte_article),0),0), 2) as prix_moyen_article
-from public.vw_gold_tickets_jour_clean_op st
-join mags m
-  on m.code_magasin = trim(st.code_magasin::text)
-join op
-  on st.ticket_date between op.date_debut and op.date_fin
-left join public.ref_magasin rm
-  on trim(rm.code_magasin::text) = trim(st.code_magasin::text)
-where {scope_sql};
-"""
-    params = (*mags_params, code_op, *scope_params)
-    df = read_df(sql, params=params)
-    if df.empty:
-        return pd.DataFrame([{
-            "ca": 0, "tickets": 0, "qte_articles": 0,
-            "panier_moyen": 0, "indice_vente": 0, "prix_moyen_article": 0
-        }])
-    return df
-
-
-def count_magasin_query(code_op: str, scope: str, mags_sql: str, mags_params: tuple) -> int:
-    scope_sql, scope_params = _scope_clause_and_params(scope)
-
-    sql = f"""
-{mags_sql},
-op as (
-  select date_debut, date_fin
-  from public.vw_operations_dedup
-  where code_operation = %s
-  limit 1
-)
-select count(distinct trim(st.code_magasin::text)) as nb_magasin
-from public.vw_gold_tickets_jour_clean_op st
-join mags m on m.code_magasin = trim(st.code_magasin::text)
-join op on st.ticket_date between op.date_debut and op.date_fin
-left join public.ref_magasin rm on trim(rm.code_magasin::text) = trim(st.code_magasin::text)
-where {scope_sql};
-"""
-    params = (*mags_params, code_op, *scope_params)
-    df = read_df(sql, params=params)
-    return int(df["nb_magasin"].iloc[0] or 0) if not df.empty else 0
-
-
-# =========================
-# DAILY SERIES (Jour 1..N)
-# =========================
-def daily_kpis_query(code_op: str, mags_sql: str, mags_params: tuple) -> pd.DataFrame:
-    sql = f"""
-{mags_sql},
-op as (
-  select date_debut, date_fin
-  from public.vw_operations_dedup
-  where code_operation = %s
-  limit 1
-)
-select
-  (st.ticket_date - op.date_debut + 1) as day_idx,
-  coalesce(sum(st.total_ttc_net),0) as ca,
-  coalesce(sum(st.nb_tickets),0) as tickets,
-  coalesce(sum(st.qte_article),0) as qte_articles,
-  round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as panier_moyen,
-  round(coalesce(sum(st.qte_article),0)::numeric / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as indice_vente,
-  round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.qte_article),0),0), 2) as prix_moyen_article
-from public.vw_gold_tickets_jour_clean_op st
-join mags m on m.code_magasin = trim(st.code_magasin::text)
-join op on st.ticket_date between op.date_debut and op.date_fin
-group by (st.ticket_date - op.date_debut + 1)
-order by day_idx;
-"""
-    df = read_df(sql, params=(*mags_params, code_op))
-    if df.empty:
-        return df
-    df["day_idx"] = df["day_idx"].astype(int)
-    return df
-
-
-# =========================
-# FICHE MAGASIN
-# =========================
-def magasin_info_query(code_magasin: str) -> pd.DataFrame:
-    cols = table_columns("public", "ref_magasin")
-
-    col_addr = pick_first(cols, [
-        "adresse_:_adresse_de_livraison_:_adresse_1",
-        "adresses_:_adresse_de_livraison_:_adresse_1",
-    ])
-    col_cp = pick_first(cols, [
-        "adresse_:_adresse_de_livraison_:_cp",
-        "adresses_:_adresse_de_livraison_:_cp",
-    ])
-    col_ville = pick_first(cols, [
-        "adresse_:_adresse_de_livraison_:_ville",
-        "adresses_:_adresse_de_livraison_:_ville",
-    ])
-    col_pays = pick_first(cols, [
-        "adresse_:_adresse_de_livraison_:_pays",
-        "adresses_:_adresse_de_livraison_:_pays",
-    ])
-
-    sql = f"""
-select
-  trim(rm.code_magasin::text) as code_magasin,
-  rm.nom_magasin,
-  {sel_or_null("telephone", "telephone", cols)},
-  {sel_or_null("e_mail", "e_mail", cols)},
-  {sel_or_null(col_addr, "adresse", cols)},
-  {sel_or_null(col_cp, "cp", cols)},
-  {sel_or_null(col_ville, "ville", cols)},
-  {sel_or_null(col_pays, "pays", cols)},
-  {sel_or_null("type", "type", cols)},
-  {sel_or_null("statut", "statut", cols)},
-  {sel_or_null("rcr", "rcr", cols)},
-  {sel_or_null("rdr", "rdr", cols)},
-  {sel_or_null("nom_franchise", "nom_franchise", cols)},
-  {sel_or_null("prenom_franchise", "prenom_franchise", cols)},
-  {sel_or_null("telephone_franchise", "telephone_franchise", cols)}
-from public.ref_magasin rm
-where trim(rm.code_magasin::text) = %s
-limit 1;
-"""
-    return read_df(sql, params=(code_magasin,))
-
-
-def meteo_filename_for_op(code_op: str, mags_sql: str, mags_params: tuple) -> str | None:
-    sql = f"""
-{mags_sql},
-op as (
-  select date_debut, date_fin
-  from public.vw_operations_dedup
-  where code_operation = %s
-  limit 1
-)
-select st.asset_file_meteo
-from public.vw_gold_tickets_jour_clean_op st
-join mags m on m.code_magasin = trim(st.code_magasin::text)
-join op on st.ticket_date between op.date_debut and op.date_fin
-where coalesce(st.asset_file_meteo,'') <> ''
-group by st.asset_file_meteo
-order by count(*) desc
-limit 1;
-"""
-    df = read_df(sql, params=(*mags_params, code_op))
-    if df.empty:
+def _dept_from_cp(cp: str) -> str | None:
+    if not cp:
         return None
-    return df.iloc[0]["asset_file_meteo"]
+    s = str(cp).strip()
+    if not s:
+        return None
+    s = "".join(ch for ch in s if ch.isdigit())
+    if len(s) < 2:
+        return None
+    return s[:2]
 
 
+IDF_DEPTS = {"75", "77", "78", "91", "92", "93", "94", "95"}
+
+
+# =========================
+# Load codes magasins A/B (comme Commerce)
+# =========================
+with st.spinner(SPINNER_TXT):
+    magsA_codes = _norm_code_list(fetch_selected_mags(mags_cte_sql_A, mags_cte_params_A))
+    magsB_codes = _norm_code_list(fetch_selected_mags(mags_cte_sql_B, mags_cte_params_B))
+
+st.markdown("## 🧩 Global — KPI (A vs B)")
+st.caption(f"Magasins sélectionnés (parc filtres) : **{len(magsA_codes)}** vs **{len(magsB_codes)}**")
+st.divider()
+
+# =========================
+# Ref magasin (pour scopes + fiche magasin)
+# =========================
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_ref_magasin_for_codes(codes: list[str]) -> pd.DataFrame:
+    if not codes:
+        return pd.DataFrame(
+            columns=[
+                "code_magasin",
+                "nom_magasin",
+                "ville",
+                "cp",
+                "pays",
+                "type",
+                "statut",
+                "rcr",
+                "rdr",
+                "telephone",
+                "e_mail",
+                "adresse",
+                "nom_franchise",
+                "prenom_franchise",
+                "telephone_franchise",
+            ]
+        )
+    sql = """
+select
+  upper(trim(rm.code_magasin::text)) as code_magasin,
+  rm.nom_magasin,
+  coalesce(rm."adresses_:_adresse_de_livraison_:_ville",'') as ville,
+  coalesce(rm."adresses_:_adresse_de_livraison_:_cp",'') as cp,
+  coalesce(rm."adresses_:_adresse_de_livraison_:_pays",'') as pays,
+  rm.type,
+  rm.statut,
+  rm.rcr,
+  rm.rdr,
+  rm.telephone,
+  rm.e_mail,
+  rm."adresses_:_adresse_de_livraison_:_adresse_1" as adresse,
+  rm.nom_franchise,
+  rm.prenom_franchise,
+  rm.telephone_franchise
+from public.ref_magasin rm
+where upper(trim(rm.code_magasin::text)) = any(%s);
+"""
+    return read_df(sql, (codes,))
+
+
+with st.spinner(SPINNER_TXT):
+    codes_union = _norm_code_list(magsA_codes + magsB_codes)
+    df_ref = load_ref_magasin_for_codes(codes_union)
+
+ref_map = {}
+if not df_ref.empty:
+    ref_map = {r["code_magasin"]: r for _, r in df_ref.iterrows()}
+
+# =========================
+# Magasins présents dans les ventes (sur période)
+# ✅ canonise st.code_magasin (ancien_code -> code_magasin)
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def sales_present_codes(codes: list[str], date_debut: str, date_fin: str) -> list[str]:
+    if not codes:
+        return []
+    sql = """
+select distinct
+  coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) as code_magasin
+from public.vw_gold_tickets_jour_clean_op st
+left join public.vw_param_magasin_ancien_code mp
+  on mp.ancien_code = upper(trim(st.code_magasin::text))
+where st.ticket_date >= %s::date
+  and st.ticket_date <= %s::date
+  and coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) = any(%s);
+"""
+    df = read_df(sql, (date_debut, date_fin, codes))
+    if df.empty:
+        return []
+    return _norm_code_list(df["code_magasin"].tolist())
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def kpi_from_codes(codes: list[str], date_debut: str, date_fin: str) -> dict:
+    if not codes:
+        return {
+            "ca": 0.0,
+            "tickets": 0.0,
+            "qte_articles": 0.0,
+            "panier_moyen": 0.0,
+            "indice_vente": 0.0,
+            "prix_moyen_article": 0.0,
+        }
+    sql = """
+select
+  coalesce(sum(st.total_ttc_net),0)::numeric as ca,
+  coalesce(sum(st.nb_tickets),0)::numeric as tickets,
+  coalesce(sum(st.qte_article),0)::numeric as qte_articles,
+  round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as panier_moyen,
+  round(coalesce(sum(st.qte_article),0)::numeric / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as indice_vente,
+  round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.qte_article),0),0), 2) as prix_moyen_article
+from public.vw_gold_tickets_jour_clean_op st
+left join public.vw_param_magasin_ancien_code mp
+  on mp.ancien_code = upper(trim(st.code_magasin::text))
+where st.ticket_date >= %s::date
+  and st.ticket_date <= %s::date
+  and coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) = any(%s);
+"""
+    df = read_df(sql, (date_debut, date_fin, codes))
+    if df.empty:
+        return {
+            "ca": 0.0,
+            "tickets": 0.0,
+            "qte_articles": 0.0,
+            "panier_moyen": 0.0,
+            "indice_vente": 0.0,
+            "prix_moyen_article": 0.0,
+        }
+    r = df.iloc[0].to_dict()
+    return {k: _safe_float(r.get(k)) for k in ["ca", "tickets", "qte_articles", "panier_moyen", "indice_vente", "prix_moyen_article"]}
+
+
+# =========================
+# Scopes (Python) — basés CP
+# =========================
+def filter_codes_scope(codes: list[str], scope: str) -> list[str]:
+    if not codes:
+        return []
+
+    scope = (scope or "ALL").upper()
+    if scope == "ALL":
+        return codes
+
+    kept = []
+    for c in codes:
+        r = ref_map.get(c)
+        cp = (r.get("cp") if r is not None else "") if isinstance(r, dict) else (r["cp"] if r is not None else "")
+        dept = _dept_from_cp(cp)
+
+        if scope == "PARIS":
+            if dept == "75":
+                kept.append(c)
+
+        elif scope == "IDF":
+            if dept in IDF_DEPTS:
+                kept.append(c)
+
+        elif scope == "PROVINCE":
+            if dept is None:
+                continue
+            if dept not in IDF_DEPTS:
+                kept.append(c)
+
+        else:
+            kept.append(c)
+
+    return _norm_code_list(kept)
+
+
+# =========================
+# Fiche magasin (simple)
+# =========================
 def render_magasin_fiche(code_magasin: str):
-    st.markdown("## 🏬 Fiche magasin")
-
-    info = magasin_info_query(code_magasin)
-    if info.empty:
+    code_magasin = (code_magasin or "").strip().upper()
+    r = ref_map.get(code_magasin)
+    if r is None:
         st.warning("Magasin introuvable dans ref_magasin.")
         return
-    rm = info.iloc[0]
 
-    statut = (rm.get("statut") or "").strip()
-    badge_cls = "badge-neutral"
-    if statut:
-        s = statut.lower()
-        if "ouvert" in s or "actif" in s:
-            badge_cls = "badge-ok"
-        elif "fermé" in s or "ferme" in s or "inactif" in s:
-            badge_cls = "badge-warn"
+    nom = r.get("nom_magasin") or ""
+    tel = (r.get("telephone") or "").strip()
+    mail = (r.get("e_mail") or "").strip()
+    adr = (r.get("adresse") or "").strip()
+    cp = (r.get("cp") or "").strip()
+    ville = (r.get("ville") or "").strip()
+    pays = (r.get("pays") or "").strip()
 
-    title = f"{rm['code_magasin']} — {rm.get('nom_magasin') or ''}"
-
-    phone = (rm.get("telephone") or "").strip()
-    email = (rm.get("e_mail") or "").strip()
-
-    adresse = (rm.get("adresse") or "").strip()
-    cp = (rm.get("cp") or "").strip()
-    ville = (rm.get("ville") or "").strip()
-    pays = (rm.get("pays") or "").strip()
-
-    type_m = (rm.get("type") or "-")
-    rcr = (rm.get("rcr") or "-")
-    rdr = (rm.get("rdr") or "-")
-
-    nom_f = (rm.get("nom_franchise") or "").strip()
-    prenom_f = (rm.get("prenom_franchise") or "").strip()
-    tel_f = (rm.get("telephone_franchise") or "").strip()
-    is_franchise = bool(nom_f or prenom_f or tel_f)
-
+    statut = (r.get("statut") or "").strip()
     badges = []
     if statut:
-        badges.append((statut, badge_cls))
-    if is_franchise:
-        badges.append(("Franchise", "badge-ok"))
+        cls = "badge-ok" if ("actif" in statut.lower() or "ouvert" in statut.lower()) else "badge-warn"
+        badges.append((statut, cls))
 
-    col_left = [("Code:", rm["code_magasin"]), ("Nom:", rm.get("nom_magasin") or "—")]
-    if phone:
-        col_left.append(("Téléphone:", phone))
-    if email:
-        col_left.append(("Email:", f'<a href="mailto:{email}">{email}</a>'))
+    nom_f = (r.get("nom_franchise") or "").strip()
+    prenom_f = (r.get("prenom_franchise") or "").strip()
+    tel_f = (r.get("telephone_franchise") or "").strip()
 
-    col_mid = [
-        ("Adresse:", adresse or "—"),
-        ("CP / Ville:", f"{cp} {ville}".strip() or "—"),
-        ("Pays:", pays or "—"),
-    ]
+    title = f"{code_magasin} — {nom}"
+    subtitle = "  •  ".join([x for x in [f"📞 {tel}" if tel else "", f"✉️ {mail}" if mail else ""] if x])
 
-    col_right = [("Type:", type_m), ("RCR:", rcr), ("RDR:", rdr)]
-    if is_franchise:
-        franch_name = (prenom_f + " " + nom_f).strip()
-        if franch_name:
-            col_right.append(("Franchisé:", franch_name))
-        if tel_f:
-            col_right.append(("Tél. franchisé:", tel_f))
+    col_left = [("Type :", r.get("type") or "—"), ("RCR :", r.get("rcr") or "—"), ("RDR :", r.get("rdr") or "—")]
+    col_mid = [("Adresse :", adr or "—"), ("CP / Ville :", f"{cp} {ville}".strip() or "—"), ("Pays :", pays or "—")]
+    col_right = []
+    if nom_f or prenom_f:
+        col_right.append(("Franchisé :", f"{prenom_f} {nom_f}".strip()))
+    if tel_f:
+        col_right.append(("Tél. franchisé :", tel_f))
 
     store_card_3col_html(
         title=title,
-        subtitle="",
+        subtitle=subtitle,
         badges=badges,
         col_left=col_left,
         col_mid=col_mid,
         col_right=col_right,
-        left_title="Identité & contact",
+        left_title="Infos magasin",
         mid_title="Adresse",
-        right_title="Infos magasin",
+        right_title="Franchise",
     )
-
-    store_mags_sql, store_mags_params = mags_cte_for_store(code_magasin)
-
-    st.markdown("### 🌤️ Météo (icônes) — magasin")
-    fileA = meteo_filename_for_op(code_opA, store_mags_sql, store_mags_params)
-    fileB = meteo_filename_for_op(code_opB, store_mags_sql, store_mags_params)
-
-    m1, m2 = st.columns(2)
-    with m1:
-        st.markdown(f"**Année N — {lib_opA}**")
-        st_meteo_asset(fileA, width=72)
-    with m2:
-        st.markdown(f"**Année N-1 — {lib_opB}**")
-        st_meteo_asset(fileB, width=72)
-
-    st.divider()
-
-    rA = kpi_query(code_opA, "ALL", store_mags_sql, store_mags_params).iloc[0]
-    rB = kpi_query(code_opB, "ALL", store_mags_sql, store_mags_params).iloc[0]
-
-    st.markdown("### 📌 Performance (N vs N-1)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        kpi_card_compare("CA", float(rA["ca"] or 0), float(rB["ca"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
-    with c2:
-        kpi_card_compare("Tickets", float(rA["tickets"] or 0), float(rB["tickets"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
-    with c3:
-        kpi_card_compare("Panier moyen", float(rA["panier_moyen"] or 0), float(rB["panier_moyen"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
-
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        kpi_card_compare("Articles vendus", float(rA["qte_articles"] or 0), float(rB["qte_articles"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
-    with c5:
-        kpi_card_compare("Prix moyen article", float(rA["prix_moyen_article"] or 0), float(rB["prix_moyen_article"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
-    with c6:
-        kpi_card_compare("Indice de vente", float(rA["indice_vente"] or 0), float(rB["indice_vente"] or 0), lib_opA, lib_opB, formatter=lambda x: f"{x:.2f}")
-
-    st.divider()
-
-    st.markdown("### 📈 Évolution jour par jour (Jour 1 → Jour N) — superposition N vs N-1")
-
-    dfA = daily_kpis_query(code_opA, store_mags_sql, store_mags_params)
-    dfB = daily_kpis_query(code_opB, store_mags_sql, store_mags_params)
-
-    if dfA.empty and dfB.empty:
-        st.info("Aucune donnée journalière pour ce magasin sur les périodes sélectionnées.")
-        return
-
-    def _prep(df: pd.DataFrame, suffix: str):
-        if df.empty:
-            return pd.DataFrame(columns=["day_idx"])
-        out = df.copy()
-        out = out.rename(columns={
-            "ca": f"ca{suffix}",
-            "tickets": f"tickets{suffix}",
-            "qte_articles": f"qte_articles{suffix}",
-            "panier_moyen": f"panier_moyen{suffix}",
-            "indice_vente": f"indice_vente{suffix}",
-            "prix_moyen_article": f"prix_moyen_article{suffix}",
-        })
-        return out
-
-    A = _prep(dfA, "_A")
-    B = _prep(dfB, "_B")
-
-    merged = pd.merge(A, B, on="day_idx", how="outer").sort_values("day_idx").set_index("day_idx")
-
-    def chart_two(colA: str, colB: str, title: str):
-        c = pd.DataFrame({
-            lib_opA: merged[colA] if colA in merged.columns else None,
-            lib_opB: merged[colB] if colB in merged.columns else None,
-        })
-        st.markdown(f"**{title}**")
-        st.line_chart(c)
-
-    chart_two("ca_A", "ca_B", "CA")
-    chart_two("tickets_A", "tickets_B", "Tickets")
-    chart_two("qte_articles_A", "qte_articles_B", "Articles vendus")
-    chart_two("panier_moyen_A", "panier_moyen_B", "Panier moyen")
-    chart_two("prix_moyen_article_A", "prix_moyen_article_B", "Prix moyen article")
-    chart_two("indice_vente_A", "indice_vente_B", "Indice de vente")
-
-    st.divider()
 
 
 # =========================
-# Vues scopes — parc A/B séparés
+# Block rendu scope
 # =========================
 def render_scope_block(title: str, scope_code: str):
     st.markdown(f"## {title}")
 
-    nb_mag_A = count_magasin_query(code_opA, scope_code, mags_cte_sql_A, mags_cte_params_A)
-    nb_mag_B = count_magasin_query(code_opB, scope_code, mags_cte_sql_B, mags_cte_params_B)
-    st.caption(f"Magasins — Année N: **{nb_mag_A}** | Année N-1: **{nb_mag_B}**")
+    # Codes scope (parc filtres)
+    codesA_scope = filter_codes_scope(magsA_codes, scope_code)
+    codesB_scope = filter_codes_scope(magsB_codes, scope_code)
 
-    rA = kpi_query(code_opA, scope_code, mags_cte_sql_A, mags_cte_params_A).iloc[0]
-    rB = kpi_query(code_opB, scope_code, mags_cte_sql_B, mags_cte_params_B).iloc[0]
+    # Magasins présents dans les ventes (✅ canon)
+    presentA = sales_present_codes(codesA_scope, dateA0, dateA1)
+    presentB = sales_present_codes(codesB_scope, dateB0, dateB1)
+
+    st.caption(
+        f"Magasins (présents dans les ventes sur la période) — Année N: **{len(presentA)}** | Année N-1: **{len(presentB)}**"
+    )
+
+    # KPI calculés sur les codes scope (✅ canon)
+    rA = kpi_from_codes(codesA_scope, dateA0, dateA1)
+    rB = kpi_from_codes(codesB_scope, dateB0, dateB1)
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        kpi_card_compare("CA", float(rA["ca"] or 0), float(rB["ca"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+        kpi_card_compare("CA", rA["ca"], rB["ca"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
     with c2:
-        kpi_card_compare("Tickets", float(rA["tickets"] or 0), float(rB["tickets"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+        kpi_card_compare("Tickets", rA["tickets"], rB["tickets"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
     with c3:
-        kpi_card_compare("Panier moyen", float(rA["panier_moyen"] or 0), float(rB["panier_moyen"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+        kpi_card_compare("Panier moyen", rA["panier_moyen"], rB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        kpi_card_compare("Articles vendus", float(rA["qte_articles"] or 0), float(rB["qte_articles"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+        kpi_card_compare("Articles vendus", rA["qte_articles"], rB["qte_articles"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
     with c5:
-        kpi_card_compare("Prix moyen article", float(rA["prix_moyen_article"] or 0), float(rB["prix_moyen_article"] or 0), lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+        kpi_card_compare("Prix moyen article", rA["prix_moyen_article"], rB["prix_moyen_article"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
     with c6:
-        kpi_card_compare("Indice de vente", float(rA["indice_vente"] or 0), float(rB["indice_vente"] or 0), lib_opA, lib_opB, formatter=lambda x: f"{x:.2f}")
+        kpi_card_compare("Indice de vente", rA["indice_vente"], rB["indice_vente"], lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f}")
 
     st.divider()
 
@@ -499,7 +384,32 @@ def render_scope_block(title: str, scope_code: str):
 # LOGIQUE D'AFFICHAGE
 # =========================
 if code_magasin_selected:
+    st.markdown("## 🏬 Magasin sélectionné")
     render_magasin_fiche(code_magasin_selected)
+    st.divider()
+
+    codes_store = [code_magasin_selected]
+
+    rA = kpi_from_codes(codes_store, dateA0, dateA1)
+    rB = kpi_from_codes(codes_store, dateB0, dateB1)
+
+    st.markdown("## 📌 Performance (N vs N-1) — magasin")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        kpi_card_compare("CA", rA["ca"], rB["ca"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+    with c2:
+        kpi_card_compare("Tickets", rA["tickets"], rB["tickets"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    with c3:
+        kpi_card_compare("Panier moyen", rA["panier_moyen"], rB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        kpi_card_compare("Articles vendus", rA["qte_articles"], rB["qte_articles"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    with c5:
+        kpi_card_compare("Prix moyen article", rA["prix_moyen_article"], rB["prix_moyen_article"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+    with c6:
+        kpi_card_compare("Indice de vente", rA["indice_vente"], rB["indice_vente"], lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f}")
+
 else:
     render_scope_block("Tous les magasins", "ALL")
     render_scope_block("Paris", "PARIS")
