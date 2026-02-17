@@ -6,6 +6,8 @@
 # ✅ FIX TIMEOUT : on calcule les magasins (mags) UNE SEULE FOIS -> puis ANY(%s)
 # ✅ FIX CARTE : plus de hovertemplate basé sur customdata (erreur "customdata not defined")
 # ✅ Tables “plus marketing” : € + % + intitulés plus propres
+# ✅ FIX A=B (ex: Saint Valentin 2026 vs Saint Valentin 2026) :
+#    - labels display distincts (A)/(B) pour éviter colonnes dupliquées
 # -----------------------------------------------------------------------------
 
 import io
@@ -45,6 +47,13 @@ OP_MV_POIDS = {
     "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
 }
 
+# ⚠️ Ops "non produit / non nationale produit" : pas de poids OP / pas d'indicateurs produits OP
+OPS_SANS_PRODUIT = {
+    "st_valentin_2026",
+    "st_valentin_2025",
+    # ajoute ici d’autres opérations locales si besoin
+}
+
 
 # =============================================================================
 # HELPERS
@@ -66,6 +75,17 @@ def _fmt_pct(x, decimals=1) -> str:
         return f"{v:.{decimals}f} %"
     except Exception:
         return ""
+
+
+def _distinct_labels_for_display(label_A: str, label_B: str):
+    """
+    Evite les colonnes dupliquées dans les tables quand A == B (ex: même libellé).
+    """
+    a = str(label_A or "").strip()
+    b = str(label_B or "").strip()
+    if a and (a == b):
+        return f"{a} (A)", f"{b} (B)"
+    return a, b
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -92,7 +112,6 @@ def plot_regions_plotly(df_region: pd.DataFrame, geojson: dict, label_A: str, la
     else:
         q5, q95 = -30, 30
 
-    # ✅ hover stable
     fig = px.choropleth(
         df_region,
         geojson=geojson,
@@ -451,6 +470,9 @@ dateB0 = str(ctx["opB"]["date_debut"])
 dateB1 = str(ctx["opB"]["date_fin"])
 code_opB = ctx["opB"]["code"]
 
+# ✅ labels d’affichage distincts si A == B (évite colonnes dupliquées)
+libA_disp, libB_disp = _distinct_labels_for_display(lib_opA, lib_opB)
+
 mags_cte_sql_A = ctx["mags_cte_sql_A"]
 mags_cte_params_A = ctx["mags_cte_params_A"]
 mags_cte_sql_B = ctx["mags_cte_sql_B"]
@@ -460,6 +482,9 @@ mvA_periode = OP_MV_PERIODE.get(code_opA)
 mvB_periode = OP_MV_PERIODE.get(code_opB)
 mvA_poids = OP_MV_POIDS.get(code_opA)
 mvB_poids = OP_MV_POIDS.get(code_opB)
+
+isA_sans_produit = code_opA in OPS_SANS_PRODUIT
+isB_sans_produit = code_opB in OPS_SANS_PRODUIT
 
 # ✅ FIX TIMEOUT : on récupère UNE fois la liste magasins A/B
 with st.spinner(SPINNER_TXT):
@@ -471,6 +496,11 @@ nb_mag_selected_B = len(magsB_codes)
 
 st.markdown("## 🧩 Commerce — KPI (A vs B)")
 st.caption(f"Magasins sélectionnés (parc + filtres) : **{nb_mag_selected_A}** vs **{nb_mag_selected_B}**")
+
+# message global (une seule fois)
+if (isA_sans_produit or isB_sans_produit):
+    st.info("ℹ️ Cette opération n’est pas une opération nationale produit : les indicateurs 'produits OP' et les 'poids OP' ne sont pas calculés.")
+
 st.divider()
 
 with st.spinner(SPINNER_TXT):
@@ -480,32 +510,35 @@ with st.spinner(SPINNER_TXT):
 opA = {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
 opB = {"ca_op_total": 0.0, "qte_op_total": 0.0, "tickets_op_total": 0.0}
 
+# --- MV PERIODE
 if mvA_periode:
     with st.spinner(SPINNER_TXT):
         opA = load_op_totaux_depuis_mv_periode_codes(magsA_codes, mvA_periode)
-else:
-    st.warning(f"MV période OP manquante pour {code_opA}. Ajoute-la dans OP_MV_PERIODE.")
+elif not isA_sans_produit:
+    st.warning(f"MV période OP manquante pour {code_opA}. (mapping OP_MV_PERIODE)")
 
 if mvB_periode:
     with st.spinner(SPINNER_TXT):
         opB = load_op_totaux_depuis_mv_periode_codes(magsB_codes, mvB_periode)
-else:
-    st.warning(f"MV période OP manquante pour {code_opB}. Ajoute-la dans OP_MV_PERIODE.")
+elif not isB_sans_produit:
+    st.warning(f"MV période OP manquante pour {code_opB}. (mapping OP_MV_PERIODE)")
 
 poidsA = {"poids_ca": 0.0, "poids_volume": 0.0}
 poidsB = {"poids_ca": 0.0, "poids_volume": 0.0}
 
+# --- MV POIDS
 if mvA_poids:
     with st.spinner(SPINNER_TXT):
         poidsA = load_poids_op_global_depuis_mv_poids_codes(magsA_codes, mvA_poids)
-else:
-    st.warning(f"MV poids OP manquante pour {code_opA}. Ajoute-la dans OP_MV_POIDS.")
+elif not isA_sans_produit:
+    st.warning(f"MV poids OP manquante pour {code_opA}. (mapping OP_MV_POIDS)")
 
 if mvB_poids:
     with st.spinner(SPINNER_TXT):
         poidsB = load_poids_op_global_depuis_mv_poids_codes(magsB_codes, mvB_poids)
-else:
-    st.warning(f"MV poids OP manquante pour {code_opB}. Ajoute-la dans OP_MV_POIDS.")
+elif not isB_sans_produit:
+    st.warning(f"MV poids OP manquante pour {code_opB}. (mapping OP_MV_POIDS)")
+
 
 # =============================================================================
 # KPI — 3 lignes de 4 KPI
@@ -515,33 +548,33 @@ pma_B = 0.0 if float(totB["articles_total"] or 0) == 0 else float(totB["ca_total
 
 r1 = st.columns(4)
 with r1[0]:
-    kpi_card_compare("CA total (€)", totA["ca_total"], totB["ca_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare("CA total (€)", totA["ca_total"], totB["ca_total"], libA_disp, libB_disp, formatter=lambda x: fmt_money(x, 0))
 with r1[1]:
-    kpi_card_compare("Tickets total", totA["tickets_total"], totB["tickets_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Tickets total", totA["tickets_total"], totB["tickets_total"], libA_disp, libB_disp, formatter=lambda x: fmt_int(x))
 with r1[2]:
-    kpi_card_compare("Articles vendus", totA["articles_total"], totB["articles_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Articles vendus", totA["articles_total"], totB["articles_total"], libA_disp, libB_disp, formatter=lambda x: fmt_int(x))
 with r1[3]:
-    kpi_card_compare("Panier moyen (€)", totA["panier_moyen"], totB["panier_moyen"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+    kpi_card_compare("Panier moyen (€)", totA["panier_moyen"], totB["panier_moyen"], libA_disp, libB_disp, formatter=lambda x: fmt_money(x, 2))
 
 r2 = st.columns(4)
 with r2[0]:
-    kpi_card_compare("Indice de vente (articles/ticket)", totA["indice_vente"], totB["indice_vente"], lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f}")
+    kpi_card_compare("Indice de vente (articles/ticket)", totA["indice_vente"], totB["indice_vente"], libA_disp, libB_disp, formatter=lambda x: f"{float(x or 0):.2f}")
 with r2[1]:
-    kpi_card_compare("Prix moyen article (€)", pma_A, pma_B, lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 2))
+    kpi_card_compare("Prix moyen article (€)", pma_A, pma_B, libA_disp, libB_disp, formatter=lambda x: fmt_money(x, 2))
 with r2[2]:
-    kpi_card_compare("CA produits OP (€)", opA["ca_op_total"], opB["ca_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare("CA produits OP (€)", opA["ca_op_total"], opB["ca_op_total"], libA_disp, libB_disp, formatter=lambda x: fmt_money(x, 0))
 with r2[3]:
-    kpi_card_compare("Tickets produits OP", opA["tickets_op_total"], opB["tickets_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Tickets produits OP", opA["tickets_op_total"], opB["tickets_op_total"], libA_disp, libB_disp, formatter=lambda x: fmt_int(x))
 
 r3 = st.columns(4)
 with r3[0]:
-    kpi_card_compare("Articles OP vendus", opA["qte_op_total"], opB["qte_op_total"], lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Articles OP vendus", opA["qte_op_total"], opB["qte_op_total"], libA_disp, libB_disp, formatter=lambda x: fmt_int(x))
 with r3[1]:
-    kpi_card_compare("Poids OP valeur (%)", poidsA["poids_ca"] * 100.0, poidsB["poids_ca"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
+    kpi_card_compare("Poids OP valeur (%)", poidsA["poids_ca"] * 100.0, poidsB["poids_ca"] * 100.0, libA_disp, libB_disp, formatter=lambda x: f"{float(x or 0):.2f} %")
 with r3[2]:
-    kpi_card_compare("Poids OP volume (%)", poidsA["poids_volume"] * 100.0, poidsB["poids_volume"] * 100.0, lib_opA, lib_opB, formatter=lambda x: f"{float(x or 0):.2f} %")
+    kpi_card_compare("Poids OP volume (%)", poidsA["poids_volume"] * 100.0, poidsB["poids_volume"] * 100.0, libA_disp, libB_disp, formatter=lambda x: f"{float(x or 0):.2f} %")
 with r3[3]:
-    kpi_card_compare("Nb magasins (parc)", nb_mag_selected_A, nb_mag_selected_B, lib_opA, lib_opB, formatter=lambda x: fmt_int(x))
+    kpi_card_compare("Nb magasins (parc)", nb_mag_selected_A, nb_mag_selected_B, libA_disp, libB_disp, formatter=lambda x: fmt_int(x))
 
 st.divider()
 
@@ -554,11 +587,11 @@ with st.spinner(SPINNER_TXT):
     sA = load_series_jour_relative_from_codes(magsA_codes, dateA0, dateA1)
     sB = load_series_jour_relative_from_codes(magsB_codes, dateB0, dateB1)
 
-_superposed_line_by_dayindex(sA, sB, "ca_ttc_net", "CA TTC net / jour", "CA (€)", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "nb_tickets", "Tickets / jour", "Tickets", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "qte_article", "Articles / jour", "Articles", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "panier_moyen", "Panier moyen / jour", "Panier moyen (€)", lib_opA, lib_opB)
-_superposed_line_by_dayindex(sA, sB, "indice_vente", "Indice de vente / jour", "Articles / ticket", lib_opA, lib_opB)
+_superposed_line_by_dayindex(sA, sB, "ca_ttc_net", "CA TTC net / jour", "CA (€)", libA_disp, libB_disp)
+_superposed_line_by_dayindex(sA, sB, "nb_tickets", "Tickets / jour", "Tickets", libA_disp, libB_disp)
+_superposed_line_by_dayindex(sA, sB, "qte_article", "Articles / jour", "Articles", libA_disp, libB_disp)
+_superposed_line_by_dayindex(sA, sB, "panier_moyen", "Panier moyen / jour", "Panier moyen (€)", libA_disp, libB_disp)
+_superposed_line_by_dayindex(sA, sB, "indice_vente", "Indice de vente / jour", "Articles / ticket", libA_disp, libB_disp)
 
 st.divider()
 
@@ -566,7 +599,10 @@ st.divider()
 # GRAPHE POIDS OP (période) — A vs B
 # =============================================================================
 st.markdown("## ⚖️ Poids de l’opération (période) — Valeur & Volume")
-_plot_poids_bar(poidsA, poidsB, lib_opA, lib_opB)
+if isA_sans_produit and isB_sans_produit:
+    st.info("ℹ️ Pas d’analyse 'Poids OP' sur cette opération (pas de périmètre produit national).")
+else:
+    _plot_poids_bar(poidsA, poidsB, libA_disp, libB_disp)
 
 st.divider()
 
@@ -579,11 +615,11 @@ with st.spinner(SPINNER_TXT):
     dfA_store = load_store_totals_for_map_from_codes(magsA_codes, dateA0, dateA1)
     dfB_store = load_store_totals_for_map_from_codes(magsB_codes, dateB0, dateB1)
 
-    # sécurité comparable au niveau store
     dfA_store, dfB_store = _apply_comparable_scope_to_store_dfs(dfA_store, dfB_store, comparable_choice)
 
-    # régions depuis ref_magasin (rapide)
-    codes_union = sorted(set(dfA_store["code_magasin"].astype(str).tolist()).union(set(dfB_store["code_magasin"].astype(str).tolist())))
+    codes_union = sorted(
+        set(dfA_store["code_magasin"].astype(str).tolist()).union(set(dfB_store["code_magasin"].astype(str).tolist()))
+    )
     df_mag = load_mag_regions_from_codes(codes_union)
 
 df_region_A = (
@@ -608,15 +644,15 @@ df_region["variation_CA"] = np.where(
 try:
     with st.spinner(SPINNER_TXT):
         geojson = load_france_regions_geojson()
-    fig_map_regions = plot_regions_plotly(df_region, geojson, lib_opA, lib_opB)
+    fig_map_regions = plot_regions_plotly(df_region, geojson, libA_disp, libB_disp)
     st.plotly_chart(fig_map_regions, use_container_width=True)
     st.caption("Vert = progression / Rouge = baisse. Survolez pour le détail.")
 except Exception as e:
     st.warning(f"Impossible d'afficher la carte (GeoJSON): {e}")
-    st.dataframe(_prettify_region_table(df_region, lib_opA, lib_opB), use_container_width=True, hide_index=True)
+    st.dataframe(_prettify_region_table(df_region, libA_disp, libB_disp), use_container_width=True, hide_index=True)
 
 with st.expander("📋 Détail par région (table)"):
-    st.dataframe(_prettify_region_table(df_region, lib_opA, lib_opB), use_container_width=True, hide_index=True)
+    st.dataframe(_prettify_region_table(df_region, libA_disp, libB_disp), use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -659,10 +695,10 @@ df_worst = df_valid.sort_values("variation_CA_pct", ascending=True).head(10)[col
 c_top = st.columns(2)
 with c_top[0]:
     st.markdown("### ✅ Top 10 (meilleurs)")
-    st.dataframe(_prettify_store_perf(df_best, lib_opA, lib_opB), use_container_width=True, hide_index=True)
+    st.dataframe(_prettify_store_perf(df_best, libA_disp, libB_disp), use_container_width=True, hide_index=True)
 with c_top[1]:
     st.markdown("### ❌ Top 10 (pires)")
-    st.dataframe(_prettify_store_perf(df_worst, lib_opA, lib_opB), use_container_width=True, hide_index=True)
+    st.dataframe(_prettify_store_perf(df_worst, libA_disp, libB_disp), use_container_width=True, hide_index=True)
 
 st.divider()
 

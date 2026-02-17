@@ -304,7 +304,30 @@ parc_analysis as (
 
 
 # =============================================================================
-# Check data
+# NO DATA — bloc "stop" (gardé pour cas parc vide)
+# =============================================================================
+def no_data_block(msg: str):
+    st.warning(
+        f"📭 **Je n’ai pas de données pour cette période / ces filtres.**\n\n"
+        f"{msg}\n\n"
+        f"👉 Merci de choisir une autre opération (ou d’élargir les filtres)."
+    )
+    st.stop()
+
+
+# =============================================================================
+# NO DATA — message générique Achats (comme Commerce/Marketing)
+# =============================================================================
+def _info_no_achats_generic():
+    st.warning(
+        "🧾 **Aucune data Achats disponible pour cette opération.**\n\n"
+        "Cela signifie qu’il n’y a pas de lignes d’achats référencées pour l’opération sélectionnée.\n\n"
+        "👉 Essaie une autre opération, ou élargis les filtres."
+    )
+
+
+# =============================================================================
+# Check data Achats — magasin & parc
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def has_data_for_magasin(code_op: str, code_magasin: str) -> bool:
@@ -334,13 +357,19 @@ limit 1;
     return not df.empty
 
 
-def no_data_block(msg: str):
-    st.warning(
-        f"📭 **Je n’ai pas de données pour cette période / ces filtres.**\n\n"
-        f"{msg}\n\n"
-        f"👉 Merci de choisir une autre opération (ou d’élargir les filtres)."
-    )
-    st.stop()
+@st.cache_data(ttl=600, show_spinner=False)
+def has_achats_for_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> bool:
+    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+    sql = f"""
+{parc_sql}
+select 1
+from a_norm a
+join parc_analysis p
+  on p.code_magasin = a.code_magasin_canon
+limit 1;
+"""
+    df = read_df(sql, params=parc_params)
+    return not df.empty
 
 
 # =============================================================================
@@ -581,204 +610,217 @@ st.divider()
 # =============================================================================
 if code_magasin_selected:
     with st.spinner(SPINNER_TXT):
-        if not has_data_for_magasin(code_opA, code_magasin_selected):
-            no_data_block(f"Magasin **{code_magasin_selected}** : aucune ligne d’achat (remap inclus) sur **{lib_opA}**.")
+        hasA = has_data_for_magasin(code_opA, code_magasin_selected)
+        hasB = has_data_for_magasin(code_opB, code_magasin_selected)
 
-    st.markdown("## 🏬 Magasin sélectionné")
-    with st.spinner(SPINNER_TXT):
-        render_magasin_fiche(code_magasin_selected)
-    st.divider()
+    # ✅ Message générique Achats (sans stop)
+    if (not hasA) and (not hasB):
+        _info_no_achats_generic()
+    else:
+        st.markdown("## 🏬 Magasin sélectionné")
+        with st.spinner(SPINNER_TXT):
+            render_magasin_fiche(code_magasin_selected)
+        st.divider()
 
-    with st.spinner(SPINNER_TXT):
-        kA = achats_kpi_magasin(code_opA, code_magasin_selected)
-        kB = achats_kpi_magasin(code_opB, code_magasin_selected)
+        with st.spinner(SPINNER_TXT):
+            kA = achats_kpi_magasin(code_opA, code_magasin_selected)
+            kB = achats_kpi_magasin(code_opB, code_magasin_selected)
 
-    st.markdown("## 🧾 Achats – Synthèse (magasin)")
-    c1, c2, c3 = st.columns(3)
+        st.markdown("## 🧾 Achats – Synthèse (magasin)")
+        c1, c2, c3 = st.columns(3)
 
-    with c1:
-        kpi_card_compare(
-            title="Valeur achats (TTC)",
-            value_n=_f0(kA.get("valeur_achats_captee")),
-            value_n1=_f0(kB.get("valeur_achats_captee")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: fmt_money(x, 0),
+        with c1:
+            kpi_card_compare(
+                title="Valeur achats (TTC)",
+                value_n=_f0(kA.get("valeur_achats_captee")),
+                value_n1=_f0(kB.get("valeur_achats_captee")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_money(x, 0),
+            )
+        with c2:
+            kpi_card_compare(
+                title="Volume achats (qte)",
+                value_n=_f0(kA.get("volume_achats_capte")),
+                value_n1=_f0(kB.get("volume_achats_capte")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_int(x),
+            )
+        with c3:
+            kpi_card_compare(
+                title="PUM (Valeur TTC / Quantité)",
+                value_n=_f0(kA.get("pum")),
+                value_n1=_f0(kB.get("pum")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_money(x, 2),
+            )
+
+        st.divider()
+
+        st.markdown("## 💶 Prix unitaire moyen (PUM) par fournisseur — magasin")
+        st.caption("PUM = **Somme(Valeur achats TTC) / Somme(Quantités)** (pondéré).")
+
+        top_n = st.slider("Top N fournisseurs (table PUM par valeur N)", min_value=3, max_value=30, value=12, step=1)
+
+        with st.spinner(SPINNER_TXT):
+            pumA = pum_par_fournisseur_magasin(code_opA, code_magasin_selected).rename(
+                columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
+            )
+            pumB = pum_par_fournisseur_magasin(code_opB, code_magasin_selected).rename(
+                columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
+            )
+
+        merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
+        merged = merged.sort_values("valeur_A", ascending=False).head(top_n)
+
+        merged["delta_pum_pct"] = merged.apply(
+            lambda r: 0 if r["pum_B"] == 0 else (r["pum_A"] - r["pum_B"]) / abs(r["pum_B"]) * 100,
+            axis=1,
         )
-    with c2:
-        kpi_card_compare(
-            title="Volume achats (qte)",
-            value_n=_f0(kA.get("volume_achats_capte")),
-            value_n1=_f0(kB.get("volume_achats_capte")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: fmt_int(x),
+
+        display_df = merged.copy()
+        display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
+        display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
+        display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
+        display_df["Valeur A (TTC)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
+        display_df["Valeur B (TTC)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
+        display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
+        display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
+
+        st.dataframe(
+            display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (TTC)", "Valeur B (TTC)", "Qte A", "Qte B"]],
+            use_container_width=True,
+            hide_index=True,
         )
-    with c3:
-        kpi_card_compare(
-            title="PUM (Valeur TTC / Quantité)",
-            value_n=_f0(kA.get("pum")),
-            value_n1=_f0(kB.get("pum")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: fmt_money(x, 2),
-        )
-
-    st.divider()
-
-    st.markdown("## 💶 Prix unitaire moyen (PUM) par fournisseur — magasin")
-    st.caption("PUM = **Somme(Valeur achats TTC) / Somme(Quantités)** (pondéré).")
-
-    top_n = st.slider("Top N fournisseurs (table PUM par valeur N)", min_value=3, max_value=30, value=12, step=1)
-
-    with st.spinner(SPINNER_TXT):
-        pumA = pum_par_fournisseur_magasin(code_opA, code_magasin_selected).rename(
-            columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
-        )
-        pumB = pum_par_fournisseur_magasin(code_opB, code_magasin_selected).rename(
-            columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
-        )
-
-    merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
-    merged = merged.sort_values("valeur_A", ascending=False).head(top_n)
-
-    merged["delta_pum_pct"] = merged.apply(
-        lambda r: 0 if r["pum_B"] == 0 else (r["pum_A"] - r["pum_B"]) / abs(r["pum_B"]) * 100,
-        axis=1,
-    )
-
-    display_df = merged.copy()
-    display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
-    display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
-    display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
-    display_df["Valeur A (TTC)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
-    display_df["Valeur B (TTC)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
-    display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
-    display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
-
-    st.dataframe(
-        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (TTC)", "Valeur B (TTC)", "Qte A", "Qte B"]],
-        use_container_width=True,
-        hide_index=True,
-    )
 
 else:
     with st.spinner(SPINNER_TXT):
+        # ✅ parc "structurel" : si rien dans le parc, on stop (comme avant)
         if not has_data_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA):
             no_data_block("Aucun magasin dans le parc (tickets + acheteurs remap) avec les filtres actuels.")
 
-        kA = achats_kpi_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
-        kB = achats_kpi_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
+        # ✅ data achats réelle (sur parc) : si rien, message générique (sans stop)
+        hasAchA = has_achats_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
+        hasAchB = has_achats_for_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
-    st.markdown("## 🧾 Achats – Synthèse")
+    if (not hasAchA) and (not hasAchB):
+        _info_no_achats_generic()
+    else:
+        with st.spinner(SPINNER_TXT):
+            kA = achats_kpi_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
+            kB = achats_kpi_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
-    r1c1, r1c2 = st.columns(2)
-    with r1c1:
-        kpi_card_compare(
-            title="Valeur achats (TTC)",
-            value_n=_f0(kA.get("valeur_achats_captee")),
-            value_n1=_f0(kB.get("valeur_achats_captee")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: fmt_money(x, 0),
+        st.markdown("## 🧾 Achats – Synthèse")
+
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            kpi_card_compare(
+                title="Valeur achats (TTC)",
+                value_n=_f0(kA.get("valeur_achats_captee")),
+                value_n1=_f0(kB.get("valeur_achats_captee")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_money(x, 0),
+            )
+        with r1c2:
+            kpi_card_compare(
+                title="Volume achats (qte)",
+                value_n=_f0(kA.get("volume_achats_capte")),
+                value_n1=_f0(kB.get("volume_achats_capte")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_int(x),
+            )
+
+        r2c1, r2c2, r2c3 = st.columns(3)
+        with r2c1:
+            kpi_card_compare(
+                title="Parc magasins",
+                value_n=_f0(kA.get("nb_mag_parc")),
+                value_n1=_f0(kB.get("nb_mag_parc")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_int(x),
+            )
+        with r2c2:
+            kpi_card_compare(
+                title="Nb magasin en achats référencés",
+                value_n=_f0(kA.get("nb_mag_acheteurs")),
+                value_n1=_f0(kB.get("nb_mag_acheteurs")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_int(x),
+            )
+        with r2c3:
+            kpi_card_compare(
+                title="% magasin en achats référencés",
+                value_n=_f0(kA.get("pct_mag_acheteurs")),
+                value_n1=_f0(kB.get("pct_mag_acheteurs")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: f"{float(x or 0):.1f} %",
+            )
+
+        st.divider()
+
+        st.markdown("## 🥧 Répartition des magasins selon le fournisseur d’achat")
+        st.caption("Répartition en **nombre de magasins** : chaque magasin capté est affecté à son **fournisseur principal** (valeur d’achat max).")
+
+        with st.spinner(SPINNER_TXT):
+            dfA = camembert_fusion_magasin_parc(mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12)
+            dfB = camembert_fusion_magasin_parc(mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12)
+
+        all_labels = sorted(set(dfA["fournisseur"].tolist()) | set(dfB["fournisseur"].tolist()))
+        non_captes = "Autres fournisseurs (non captés)"
+        if non_captes in all_labels:
+            all_labels = [x for x in all_labels if x != non_captes] + [non_captes]
+
+        color_map = build_color_map(all_labels)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"### {lib_opA}")
+            render_pie_with_shared_palette(dfA, all_labels, color_map)
+        with c2:
+            st.markdown(f"### {lib_opB}")
+            render_pie_with_shared_palette(dfB, all_labels, color_map)
+
+        st.divider()
+
+        st.markdown("## 💶 Prix unitaire moyen (PUM) par fournisseur")
+        st.caption("PUM = **Somme(Valeur achats TTC) / Somme(Quantités)** (pondéré).")
+
+        top_n = st.slider("Top N fournisseurs (table PUM par valeur A)", min_value=3, max_value=30, value=12, step=1)
+
+        with st.spinner(SPINNER_TXT):
+            pumA = pum_par_fournisseur_parc(mags_cte_sql_A, mags_cte_params_A, code_opA).rename(
+                columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
+            )
+            pumB = pum_par_fournisseur_parc(mags_cte_sql_B, mags_cte_params_B, code_opB).rename(
+                columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
+            )
+
+        merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
+        merged = merged.sort_values("valeur_A", ascending=False).head(top_n)
+
+        merged["delta_pum_pct"] = merged.apply(
+            lambda r: 0 if r["pum_B"] == 0 else (r["pum_A"] - r["pum_B"]) / abs(r["pum_B"]) * 100,
+            axis=1,
         )
-    with r1c2:
-        kpi_card_compare(
-            title="Volume achats (qte)",
-            value_n=_f0(kA.get("volume_achats_capte")),
-            value_n1=_f0(kB.get("volume_achats_capte")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: fmt_int(x),
+
+        display_df = merged.copy()
+        display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
+        display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
+        display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
+        display_df["Valeur A (TTC)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
+        display_df["Valeur B (TTC)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
+        display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
+        display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
+
+        st.dataframe(
+            display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (TTC)", "Valeur B (TTC)", "Qte A", "Qte B"]],
+            use_container_width=True,
+            hide_index=True,
         )
-
-    r2c1, r2c2, r2c3 = st.columns(3)
-    with r2c1:
-        kpi_card_compare(
-            title="Parc magasins",
-            value_n=_f0(kA.get("nb_mag_parc")),
-            value_n1=_f0(kB.get("nb_mag_parc")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: fmt_int(x),
-        )
-    with r2c2:
-        kpi_card_compare(
-            title="Nb magasin en achats référencés",
-            value_n=_f0(kA.get("nb_mag_acheteurs")),
-            value_n1=_f0(kB.get("nb_mag_acheteurs")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: fmt_int(x),
-        )
-    with r2c3:
-        kpi_card_compare(
-            title="% magasin en achats référencés",
-            value_n=_f0(kA.get("pct_mag_acheteurs")),
-            value_n1=_f0(kB.get("pct_mag_acheteurs")),
-            label_n=lib_opA,
-            label_n1=lib_opB,
-            formatter=lambda x: f"{float(x or 0):.1f} %",
-        )
-
-    st.divider()
-
-    st.markdown("## 🥧 Répartition des magasins selon le fournisseur d’achat")
-    st.caption("Répartition en **nombre de magasins** : chaque magasin capté est affecté à son **fournisseur principal** (valeur d’achat max).")
-
-    with st.spinner(SPINNER_TXT):
-        dfA = camembert_fusion_magasin_parc(mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12)
-        dfB = camembert_fusion_magasin_parc(mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12)
-
-    all_labels = sorted(set(dfA["fournisseur"].tolist()) | set(dfB["fournisseur"].tolist()))
-    non_captes = "Autres fournisseurs (non captés)"
-    if non_captes in all_labels:
-        all_labels = [x for x in all_labels if x != non_captes] + [non_captes]
-
-    color_map = build_color_map(all_labels)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"### {lib_opA}")
-        render_pie_with_shared_palette(dfA, all_labels, color_map)
-    with c2:
-        st.markdown(f"### {lib_opB}")
-        render_pie_with_shared_palette(dfB, all_labels, color_map)
-
-    st.divider()
-
-    st.markdown("## 💶 Prix unitaire moyen (PUM) par fournisseur")
-    st.caption("PUM = **Somme(Valeur achats TTC) / Somme(Quantités)** (pondéré).")
-
-    top_n = st.slider("Top N fournisseurs (table PUM par valeur A)", min_value=3, max_value=30, value=12, step=1)
-
-    with st.spinner(SPINNER_TXT):
-        pumA = pum_par_fournisseur_parc(mags_cte_sql_A, mags_cte_params_A, code_opA).rename(
-            columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
-        )
-        pumB = pum_par_fournisseur_parc(mags_cte_sql_B, mags_cte_params_B, code_opB).rename(
-            columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
-        )
-
-    merged = pd.merge(pumA, pumB, on="fournisseur", how="outer").fillna(0)
-    merged = merged.sort_values("valeur_A", ascending=False).head(top_n)
-
-    merged["delta_pum_pct"] = merged.apply(
-        lambda r: 0 if r["pum_B"] == 0 else (r["pum_A"] - r["pum_B"]) / abs(r["pum_B"]) * 100,
-        axis=1,
-    )
-
-    display_df = merged.copy()
-    display_df["PUM A"] = display_df["pum_A"].apply(lambda x: fmt_money(x, 2))
-    display_df["PUM B"] = display_df["pum_B"].apply(lambda x: fmt_money(x, 2))
-    display_df["Δ PUM %"] = display_df["delta_pum_pct"].apply(lambda x: f"{x:+.1f}%")
-    display_df["Valeur A (TTC)"] = display_df["valeur_A"].apply(lambda x: fmt_money(x, 0))
-    display_df["Valeur B (TTC)"] = display_df["valeur_B"].apply(lambda x: fmt_money(x, 0))
-    display_df["Qte A"] = display_df["qte_A"].apply(fmt_int)
-    display_df["Qte B"] = display_df["qte_B"].apply(fmt_int)
-
-    st.dataframe(
-        display_df[["fournisseur", "PUM A", "PUM B", "Δ PUM %", "Valeur A (TTC)", "Valeur B (TTC)", "Qte A", "Qte B"]],
-        use_container_width=True,
-        hide_index=True,
-    )

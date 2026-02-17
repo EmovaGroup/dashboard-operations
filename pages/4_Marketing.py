@@ -10,6 +10,12 @@
 # Le CTE généré par filters.py peut déjà contenir un CTE "map".
 # Donc dans cette page, on utilise TOUJOURS "map2" pour éviter :
 #   WITH query name "map" specified more than once
+#
+# ✅ FIX A=B (même opération A et B) :
+# - labels d’affichage distincts (A)/(B)
+#
+# ✅ FIX StreamlitDuplicateElementId (plotly_chart) :
+# - ajouter un `key=` unique sur CHAQUE st.plotly_chart
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -61,6 +67,26 @@ def _as_rate01(v: float) -> float:
     if v > 1.0:
         return v / 100.0
     return v
+
+
+def _distinct_labels_for_display(label_A: str, label_B: str):
+    """
+    Evite les soucis quand A == B (même libellé).
+    """
+    a = str(label_A or "").strip()
+    b = str(label_B or "").strip()
+    if a and (a == b):
+        return f"{a} (A)", f"{b} (B)"
+    return a, b
+
+
+def _info_no_poids_generic(code_opA: str, code_opB: str):
+    st.info(
+        "ℹ️ **Poids / analyses produit non disponibles pour cette sélection.**\n\n"
+        "Cette comparaison concerne une opération qui n’est pas une opération nationale basée sur un ou plusieurs produits.\n"
+        "➡️ Dans ce cas, on ne calcule pas les indicateurs liés aux produits (poids valeur / poids volume, régressions, etc.).\n"
+        "Le reste des indicateurs marketing (investissements, parc, répartition packs, etc.) reste disponible."
+    )
 
 
 # =============================================================================
@@ -166,6 +192,7 @@ def _plot_reg(
     dfB: pd.DataFrame,
     label_A: str,
     label_B: str,
+    key: str,  # ✅ clé unique Streamlit
 ):
     fig = go.Figure()
     y_decimals = 4 if y_col in ("poids_ca", "poids_volume") else 2
@@ -181,7 +208,7 @@ def _plot_reg(
         height=420,
         margin=dict(l=10, r=10, t=55, b=10),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
 # =============================================================================
@@ -235,7 +262,6 @@ from base;
 
 # =============================================================================
 # Loader — métriques marketing (A ou B) sur le parc filtré
-# ✅ FIX SQL : SELECT ... FROM agg
 # ✅ map2 (pas map)
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
@@ -556,7 +582,6 @@ order by pack_eur;
 
 # =============================================================================
 # Loader — données régression (A ou B)
-# ✅ map2 (pas map) + FIX AMBIGU : qualifier p0.code_magasin
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_reg_data(
@@ -704,8 +729,8 @@ mags_cte_params_A = ctx["mags_cte_params_A"]
 mags_cte_sql_B = ctx["mags_cte_sql_B"]
 mags_cte_params_B = ctx["mags_cte_params_B"]
 
-label_A = lib_opA
-label_B = lib_opB
+# ✅ labels display distincts si A == B
+label_A, label_B = _distinct_labels_for_display(lib_opA, lib_opB)
 
 # =============================================================================
 # KPI COMMERCE (au-dessus)
@@ -805,7 +830,7 @@ with c1:
     else:
         figA = px.pie(df_pack_A, names="pack_eur", values="nb_magasin", hole=0.45, title=f"Répartition des packs — nb magasins ({label_A})")
         figA.update_traces(textinfo="percent+label")
-        st.plotly_chart(figA, use_container_width=True)
+        st.plotly_chart(figA, use_container_width=True, key=f"pie_pack_A_{code_opA}")
 
 with c2:
     if df_pack_B.empty:
@@ -813,7 +838,7 @@ with c2:
     else:
         figB = px.pie(df_pack_B, names="pack_eur", values="nb_magasin", hole=0.45, title=f"Répartition des packs — nb magasins ({label_B})")
         figB.update_traces(textinfo="percent+label")
-        st.plotly_chart(figB, use_container_width=True)
+        st.plotly_chart(figB, use_container_width=True, key=f"pie_pack_B_{code_opB}")
 
 st.divider()
 
@@ -825,29 +850,80 @@ st.markdown("## 📈 Régressions linéaires — Poids OP vs investissement (A v
 poids_mv_A = POIDS_MV_MAP.get(code_opA)
 poids_mv_B = POIDS_MV_MAP.get(code_opB)
 
+# ✅ message générique + skip (pas d’arrêt de page)
 if not poids_mv_A or not poids_mv_B:
-    st.warning(
-        "Il manque une MV de poids OP pour Op A ou Op B dans `POIDS_MV_MAP`.\n\n"
-        "➡️ Ajoute le mapping : code_operation -> nom de MV contenant `code_magasin`, `poids_ca`, `poids_volume`."
+    _info_no_poids_generic(code_opA, code_opB)
+else:
+    with st.spinner(SPINNER_TXT):
+        dfA_ermes = _load_reg_data(code_opA, poids_mv_A, "ermes", mags_cte_sql_A, mags_cte_params_A)
+        dfB_ermes = _load_reg_data(code_opB, poids_mv_B, "ermes", mags_cte_sql_B, mags_cte_params_B)
+
+        dfA_fid = _load_reg_data(code_opA, poids_mv_A, "fid", mags_cte_sql_A, mags_cte_params_A)
+        dfB_fid = _load_reg_data(code_opB, poids_mv_B, "fid", mags_cte_sql_B, mags_cte_params_B)
+
+        dfA_total = _load_reg_data(code_opA, poids_mv_A, "total", mags_cte_sql_A, mags_cte_params_A)
+        dfB_total = _load_reg_data(code_opB, poids_mv_B, "total", mags_cte_sql_B, mags_cte_params_B)
+
+    st.markdown("### Poids OP en VALEUR (CA)")
+    _plot_reg(
+        "ERMES : Investissement vs Poids OP (CA) — A vs B",
+        "Investissement ERMES (€)",
+        "poids_ca",
+        dfA_ermes,
+        dfB_ermes,
+        label_A,
+        label_B,
+        key=f"reg_ca_ermes_{code_opA}_{code_opB}",
     )
-    st.stop()
+    _plot_reg(
+        "FID : Investissement vs Poids OP (CA) — A vs B",
+        "Investissement FID (€)",
+        "poids_ca",
+        dfA_fid,
+        dfB_fid,
+        label_A,
+        label_B,
+        key=f"reg_ca_fid_{code_opA}_{code_opB}",
+    )
+    _plot_reg(
+        "TOTAL : Investissement vs Poids OP (CA) — A vs B",
+        "Investissement total (€) = ERMES + FID",
+        "poids_ca",
+        dfA_total,
+        dfB_total,
+        label_A,
+        label_B,
+        key=f"reg_ca_total_{code_opA}_{code_opB}",
+    )
 
-with st.spinner(SPINNER_TXT):
-    dfA_ermes = _load_reg_data(code_opA, poids_mv_A, "ermes", mags_cte_sql_A, mags_cte_params_A)
-    dfB_ermes = _load_reg_data(code_opB, poids_mv_B, "ermes", mags_cte_sql_B, mags_cte_params_B)
-
-    dfA_fid = _load_reg_data(code_opA, poids_mv_A, "fid", mags_cte_sql_A, mags_cte_params_A)
-    dfB_fid = _load_reg_data(code_opB, poids_mv_B, "fid", mags_cte_sql_B, mags_cte_params_B)
-
-    dfA_total = _load_reg_data(code_opA, poids_mv_A, "total", mags_cte_sql_A, mags_cte_params_A)
-    dfB_total = _load_reg_data(code_opB, poids_mv_B, "total", mags_cte_sql_B, mags_cte_params_B)
-
-st.markdown("### Poids OP en VALEUR (CA)")
-_plot_reg("ERMES : Investissement vs Poids OP (CA) — A vs B", "Investissement ERMES (€)", "poids_ca", dfA_ermes, dfB_ermes, label_A, label_B)
-_plot_reg("FID : Investissement vs Poids OP (CA) — A vs B", "Investissement FID (€)", "poids_ca", dfA_fid, dfB_fid, label_A, label_B)
-_plot_reg("TOTAL : Investissement vs Poids OP (CA) — A vs B", "Investissement total (€) = ERMES + FID", "poids_ca", dfA_total, dfB_total, label_A, label_B)
-
-st.markdown("### Poids OP en VOLUME")
-_plot_reg("ERMES : Investissement vs Poids OP (Volume) — A vs B", "Investissement ERMES (€)", "poids_volume", dfA_ermes, dfB_ermes, label_A, label_B)
-_plot_reg("FID : Investissement vs Poids OP (Volume) — A vs B", "Investissement FID (€)", "poids_volume", dfA_fid, dfB_fid, label_A, label_B)
-_plot_reg("TOTAL : Investissement vs Poids OP (Volume) — A vs B", "Investissement total (€) = ERMES + FID", "poids_volume", dfA_total, dfB_total, label_A, label_B)
+    st.markdown("### Poids OP en VOLUME")
+    _plot_reg(
+        "ERMES : Investissement vs Poids OP (Volume) — A vs B",
+        "Investissement ERMES (€)",
+        "poids_volume",
+        dfA_ermes,
+        dfB_ermes,
+        label_A,
+        label_B,
+        key=f"reg_vol_ermes_{code_opA}_{code_opB}",
+    )
+    _plot_reg(
+        "FID : Investissement vs Poids OP (Volume) — A vs B",
+        "Investissement FID (€)",
+        "poids_volume",
+        dfA_fid,
+        dfB_fid,
+        label_A,
+        label_B,
+        key=f"reg_vol_fid_{code_opA}_{code_opB}",
+    )
+    _plot_reg(
+        "TOTAL : Investissement vs Poids OP (Volume) — A vs B",
+        "Investissement total (€) = ERMES + FID",
+        "poids_volume",
+        dfA_total,
+        dfB_total,
+        label_A,
+        label_B,
+        key=f"reg_vol_total_{code_opA}_{code_opB}",
+    )
