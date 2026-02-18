@@ -2,9 +2,10 @@
 # =============================================================================
 # PAGE : ACHATS (A vs B) — parcs séparés A/B + normalisation ancien_code -> code_magasin
 # =============================================================================
-# Optim perf (comme Marketing/Commerce) :
-# ✅ @st.cache_data(show_spinner=False) partout
-# ✅ spinner custom unique autour des blocs lourds
+# Objectif : même logique que Commerce/Marketing
+# ✅ On se fit AU PARC VENTES (tickets) via `mags` (déjà filtré comparable/parc/ermes/fid/etc.)
+# ✅ Puis on affiche la data Achats UNIQUEMENT sur ce parc
+# ❌ On n'ajoute PLUS les magasins acheteurs hors parc ventes
 # =============================================================================
 
 import streamlit as st
@@ -56,7 +57,7 @@ lib_opB = ctx["opB"]["lib"]
 dateB0 = str(ctx["opB"]["date_debut"])
 dateB1 = str(ctx["opB"]["date_fin"])
 
-# ✅ IMPORTANT : parcs séparés A / B (fix)
+# ✅ IMPORTANT : parcs séparés A / B
 mags_cte_sql_A = ctx["mags_cte_sql_A"]
 mags_cte_params_A = ctx["mags_cte_params_A"]
 
@@ -271,40 +272,23 @@ a_norm as (
 
 
 # =============================================================================
-# HELPERS SQL PARC
+# PARC VENTES STRICT (comme Commerce/Marketing)
 # =============================================================================
-def _parc_analysis_cte(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> tuple[str, tuple]:
-    achats_cte, achats_params = _achats_norm_cte(code_op)
-
+def _parc_sales_cte(mags_cte_sql_: str, mags_cte_params_: tuple) -> tuple[str, tuple]:
     sql = f"""
 {mags_cte_sql_},
 
-mags_dist as (
+parc_sales as (
   select distinct code_magasin
   from mags
   where code_magasin is not null
-),
-
-{achats_cte},
-
-mags_acheteurs_op as (
-  select distinct a.code_magasin_canon as code_magasin
-  from a_norm a
-  join public.ref_magasin rm
-    on trim(rm.code_magasin::text) = a.code_magasin_canon
-),
-
-parc_analysis as (
-  select code_magasin from mags_dist
-  union
-  select code_magasin from mags_acheteurs_op
 )
 """
-    return sql, tuple(list(mags_cte_params_) + achats_params)
+    return sql, mags_cte_params_
 
 
 # =============================================================================
-# NO DATA — bloc "stop" (gardé pour cas parc vide)
+# NO DATA — bloc "stop"
 # =============================================================================
 def no_data_block(msg: str):
     st.warning(
@@ -316,18 +300,17 @@ def no_data_block(msg: str):
 
 
 # =============================================================================
-# NO DATA — message générique Achats (comme Commerce/Marketing)
+# NO DATA — message générique Achats
 # =============================================================================
 def _info_no_achats_generic():
     st.warning(
         "🧾 **Aucune data Achats disponible pour cette opération.**\n\n"
-        "Cela signifie qu’il n’y a pas de lignes d’achats référencées pour l’opération sélectionnée.\n\n"
-        "👉 Essaie une autre opération, ou élargis les filtres."
+        "Cela signifie qu’il n’y a pas de lignes d’achats référencées pour l’opération sélectionnée."
     )
 
 
 # =============================================================================
-# Check data Achats — magasin & parc
+# Check data Achats — magasin & parc ventes
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def has_data_for_magasin(code_op: str, code_magasin: str) -> bool:
@@ -345,12 +328,12 @@ limit 1;
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def has_data_for_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> bool:
-    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+def has_sales_parc(mags_cte_sql_: str, mags_cte_params_: tuple) -> bool:
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
     sql = f"""
 {parc_sql}
 select 1
-from parc_analysis p
+from parc_sales
 limit 1;
 """
     df = read_df(sql, params=parc_params)
@@ -358,17 +341,20 @@ limit 1;
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def has_achats_for_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> bool:
-    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+def has_achats_for_sales_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> bool:
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
+    achats_cte, achats_params = _achats_norm_cte(code_op)
+
     sql = f"""
-{parc_sql}
+{parc_sql},
+{achats_cte}
 select 1
 from a_norm a
-join parc_analysis p
+join parc_sales p
   on p.code_magasin = a.code_magasin_canon
 limit 1;
 """
-    df = read_df(sql, params=parc_params)
+    df = read_df(sql, params=tuple(list(parc_params) + achats_params))
     return not df.empty
 
 
@@ -414,14 +400,16 @@ order by valeur desc;
 
 
 # =============================================================================
-# MODE PARC : KPI + camemberts + table PUM
+# MODE PARC (VENTES STRICT) : KPI + camemberts + table PUM
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
-def achats_kpi_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.Series:
-    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+def achats_kpi_parc_sales(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.Series:
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
+    achats_cte, achats_params = _achats_norm_cte(code_op)
 
     sql = f"""
 {parc_sql},
+{achats_cte},
 
 achats_capt as (
   select
@@ -429,11 +417,11 @@ achats_capt as (
     coalesce(sum(a."total achat"),0) as valeur_achats,
     coalesce(sum(a.quantite),0) as volume_achats
   from a_norm a
-  join parc_analysis p on p.code_magasin = a.code_magasin_canon
+  join parc_sales p on p.code_magasin = a.code_magasin_canon
   group by 1
 ),
 
-parc as (select count(*) as nb_mag_parc from parc_analysis),
+parc as (select count(*) as nb_mag_parc from parc_sales),
 acheteurs as (select count(*) as nb_mag_acheteurs from achats_capt where valeur_achats > 0),
 
 agg as (
@@ -452,7 +440,7 @@ select
   coalesce(round(nb_mag_acheteurs::numeric / nullif(nb_mag_parc,0) * 100, 1), 0) as pct_mag_acheteurs
 from agg;
 """
-    df = read_df(sql, params=parc_params)
+    df = read_df(sql, params=tuple(list(parc_params) + achats_params))
     if df.empty:
         return pd.Series(
             {
@@ -467,16 +455,18 @@ from agg;
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def camembert_fusion_magasin_parc(
+def camembert_fusion_magasin_parc_sales(
     mags_cte_sql_: str,
     mags_cte_params_: tuple,
     code_op: str,
     top_n_fournisseurs: int = 12
 ) -> pd.DataFrame:
-    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
+    achats_cte, achats_params = _achats_norm_cte(code_op)
 
     sql = f"""
 {parc_sql},
+{achats_cte},
 
 achats_mag_fourn as (
   select
@@ -484,7 +474,7 @@ achats_mag_fourn as (
     coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
     coalesce(sum(a."total achat"),0) as valeur
   from a_norm a
-  join parc_analysis p on p.code_magasin = a.code_magasin_canon
+  join parc_sales p on p.code_magasin = a.code_magasin_canon
   group by 1,2
 ),
 
@@ -523,7 +513,7 @@ capt_rest as (
 
 parc_sans_achats as (
   select p.code_magasin
-  from parc_analysis p
+  from parc_sales p
   left join best_fourn bf on bf.code_magasin = p.code_magasin
   where bf.code_magasin is null
 ),
@@ -539,26 +529,29 @@ select fournisseur, nb_mag from capt_rest where nb_mag > 0
 union all
 select fournisseur, nb_mag from autres_non_captes;
 """
-    return read_df(sql, params=parc_params)
+    return read_df(sql, params=tuple(list(parc_params) + achats_params))
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def pum_par_fournisseur_parc(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.DataFrame:
-    parc_sql, parc_params = _parc_analysis_cte(mags_cte_sql_, mags_cte_params_, code_op)
+def pum_par_fournisseur_parc_sales(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.DataFrame:
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
+    achats_cte, achats_params = _achats_norm_cte(code_op)
 
     sql = f"""
-{parc_sql}
+{parc_sql},
+{achats_cte}
 select
   coalesce(nullif(trim(a.fournisseur_norm::text),''),'Fournisseur inconnu') as fournisseur,
   coalesce(sum(a.quantite),0) as qte,
   coalesce(sum(a."total achat"),0) as valeur,
   coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
 from a_norm a
-join parc_analysis p on p.code_magasin = a.code_magasin_canon
+join parc_sales p
+  on p.code_magasin = a.code_magasin_canon
 group by 1
 order by valeur desc;
 """
-    return read_df(sql, params=parc_params)
+    return read_df(sql, params=tuple(list(parc_params) + achats_params))
 
 
 def render_pie_with_shared_palette(df: pd.DataFrame, all_labels: list[str], color_map: dict):
@@ -613,7 +606,6 @@ if code_magasin_selected:
         hasA = has_data_for_magasin(code_opA, code_magasin_selected)
         hasB = has_data_for_magasin(code_opB, code_magasin_selected)
 
-    # ✅ Message générique Achats (sans stop)
     if (not hasA) and (not hasB):
         _info_no_achats_generic()
     else:
@@ -697,20 +689,20 @@ if code_magasin_selected:
 
 else:
     with st.spinner(SPINNER_TXT):
-        # ✅ parc "structurel" : si rien dans le parc, on stop (comme avant)
-        if not has_data_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA):
-            no_data_block("Aucun magasin dans le parc (tickets + acheteurs remap) avec les filtres actuels.")
+        # ✅ parc ventes strict : si rien dans le parc, on stop
+        if not has_sales_parc(mags_cte_sql_A, mags_cte_params_A):
+            no_data_block("Aucun magasin dans le parc VENTES (tickets) avec les filtres actuels.")
 
-        # ✅ data achats réelle (sur parc) : si rien, message générique (sans stop)
-        hasAchA = has_achats_for_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
-        hasAchB = has_achats_for_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
+        # ✅ data achats réelle (sur parc ventes) : si rien, message générique (sans stop)
+        hasAchA = has_achats_for_sales_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
+        hasAchB = has_achats_for_sales_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
     if (not hasAchA) and (not hasAchB):
         _info_no_achats_generic()
     else:
         with st.spinner(SPINNER_TXT):
-            kA = achats_kpi_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
-            kB = achats_kpi_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
+            kA = achats_kpi_parc_sales(mags_cte_sql_A, mags_cte_params_A, code_opA)
+            kB = achats_kpi_parc_sales(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
         st.markdown("## 🧾 Achats – Synthèse")
 
@@ -737,7 +729,7 @@ else:
         r2c1, r2c2, r2c3 = st.columns(3)
         with r2c1:
             kpi_card_compare(
-                title="Parc magasins",
+                title="Parc magasins (ventes)",
                 value_n=_f0(kA.get("nb_mag_parc")),
                 value_n1=_f0(kB.get("nb_mag_parc")),
                 label_n=lib_opA,
@@ -769,8 +761,8 @@ else:
         st.caption("Répartition en **nombre de magasins** : chaque magasin capté est affecté à son **fournisseur principal** (valeur d’achat max).")
 
         with st.spinner(SPINNER_TXT):
-            dfA = camembert_fusion_magasin_parc(mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12)
-            dfB = camembert_fusion_magasin_parc(mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12)
+            dfA = camembert_fusion_magasin_parc_sales(mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12)
+            dfB = camembert_fusion_magasin_parc_sales(mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12)
 
         all_labels = sorted(set(dfA["fournisseur"].tolist()) | set(dfB["fournisseur"].tolist()))
         non_captes = "Autres fournisseurs (non captés)"
@@ -795,10 +787,10 @@ else:
         top_n = st.slider("Top N fournisseurs (table PUM par valeur A)", min_value=3, max_value=30, value=12, step=1)
 
         with st.spinner(SPINNER_TXT):
-            pumA = pum_par_fournisseur_parc(mags_cte_sql_A, mags_cte_params_A, code_opA).rename(
+            pumA = pum_par_fournisseur_parc_sales(mags_cte_sql_A, mags_cte_params_A, code_opA).rename(
                 columns={"qte": "qte_A", "valeur": "valeur_A", "pum": "pum_A"}
             )
-            pumB = pum_par_fournisseur_parc(mags_cte_sql_B, mags_cte_params_B, code_opB).rename(
+            pumB = pum_par_fournisseur_parc_sales(mags_cte_sql_B, mags_cte_params_B, code_opB).rename(
                 columns={"qte": "qte_B", "valeur": "valeur_B", "pum": "pum_B"}
             )
 
