@@ -533,6 +533,96 @@ select fournisseur, nb_mag from autres_non_captes;
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def camembert_fusion_franchise_parc_sales(
+    mags_cte_sql_: str,
+    mags_cte_params_: tuple,
+    code_op: str,
+    top_n_fournisseurs: int = 12
+) -> pd.DataFrame:
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
+    achats_cte, achats_params = _achats_norm_cte(code_op)
+
+    sql = f"""
+{parc_sql},
+{achats_cte},
+
+ref_franchise as (
+  select
+    trim(rm.code_magasin::text) as code_magasin,
+    upper(trim(coalesce(rm.prenom_franchise,''))) || '||' ||
+    upper(trim(coalesce(rm.nom_franchise,''))) as franchise_key
+  from public.ref_magasin rm
+  where trim(coalesce(rm.prenom_franchise,'')) <> ''
+     or trim(coalesce(rm.nom_franchise,'')) <> ''
+),
+
+franchises_parc as (
+  select distinct rf.franchise_key
+  from parc_sales p
+  join ref_franchise rf
+    on rf.code_magasin = p.code_magasin
+),
+
+franchise_fournisseurs as (
+  select distinct
+    rf.franchise_key,
+    coalesce(nullif(trim(a.fournisseur_norm::text),''), 'Fournisseur inconnu') as fournisseur
+  from a_norm a
+  join parc_sales p
+    on p.code_magasin = a.code_magasin_canon
+  join ref_franchise rf
+    on rf.code_magasin = a.code_magasin_canon
+),
+
+capt_counts as (
+  select
+    fournisseur,
+    count(distinct franchise_key)::int as nb_franchises
+  from franchise_fournisseurs
+  group by 1
+  order by nb_franchises desc
+),
+
+capt_top as (
+  select fournisseur, nb_franchises
+  from capt_counts
+  order by nb_franchises desc, fournisseur asc
+  limit {int(top_n_fournisseurs)}
+),
+
+capt_rest as (
+  select
+    'Autres fournisseurs (captés)'::text as fournisseur,
+    coalesce(sum(nb_franchises),0)::int as nb_franchises
+  from capt_counts
+  where fournisseur not in (select fournisseur from capt_top)
+),
+
+franchises_avec_achats as (
+  select distinct franchise_key
+  from franchise_fournisseurs
+),
+
+autres_non_captes as (
+  select
+    'Autres fournisseurs (non captés)'::text as fournisseur,
+    count(*)::int as nb_franchises
+  from franchises_parc fp
+  where fp.franchise_key not in (
+    select franchise_key from franchises_avec_achats
+  )
+)
+
+select fournisseur, nb_franchises as nb_mag from capt_top
+union all
+select fournisseur, nb_franchises as nb_mag from capt_rest where nb_franchises > 0
+union all
+select fournisseur, nb_franchises as nb_mag from autres_non_captes;
+"""
+    return read_df(sql, params=tuple(list(parc_params) + achats_params))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def pum_par_fournisseur_parc_sales(mags_cte_sql_: str, mags_cte_params_: tuple, code_op: str) -> pd.DataFrame:
     parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
     achats_cte, achats_params = _achats_norm_cte(code_op)
@@ -554,7 +644,12 @@ order by valeur desc;
     return read_df(sql, params=tuple(list(parc_params) + achats_params))
 
 
-def render_pie_with_shared_palette(df: pd.DataFrame, all_labels: list[str], color_map: dict):
+def render_pie_with_shared_palette(
+    df: pd.DataFrame,
+    all_labels: list[str],
+    color_map: dict,
+    value_label: str = "Nb magasins",
+):
     if df.empty or df["nb_mag"].sum() == 0:
         st.info("Aucune donnée")
         return
@@ -570,14 +665,125 @@ def render_pie_with_shared_palette(df: pd.DataFrame, all_labels: list[str], colo
         hole=0.45,
         color="fournisseur",
         color_discrete_map=color_map,
+        labels={"nb_mag": value_label},
     )
-    fig.update_traces(textinfo="percent+label", textposition="inside")
+    fig.update_traces(
+        textinfo="percent+label",
+        textposition="inside",
+        hovertemplate=f"<b>%{{label}}</b><br>{value_label} : %{{value}}<br>%{{percent}}<extra></extra>",
+    )
     fig.update_layout(
         showlegend=True,
         legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.02),
         margin=dict(t=10, b=10, l=10, r=240),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+# =============================================================================
+# HELPERS — récupérer les codes magasin des KPI
+# =============================================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def get_codes_parc_sales(mags_cte_sql_: str, mags_cte_params_: tuple) -> list[str]:
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
+
+    sql = f"""
+{parc_sql}
+select distinct trim(code_magasin::text) as code_magasin
+from parc_sales
+where code_magasin is not null
+order by 1
+"""
+    df = read_df(sql, params=parc_params)
+
+    if df.empty:
+        return []
+
+    return df["code_magasin"].astype(str).str.strip().tolist()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_codes_mag_achats_references(
+    mags_cte_sql_: str,
+    mags_cte_params_: tuple,
+    code_op: str
+) -> list[str]:
+    parc_sql, parc_params = _parc_sales_cte(mags_cte_sql_, mags_cte_params_)
+    achats_cte, achats_params = _achats_norm_cte(code_op)
+
+    sql = f"""
+{parc_sql},
+{achats_cte}
+select distinct a.code_magasin_canon as code_magasin
+from a_norm a
+join parc_sales p
+  on p.code_magasin = a.code_magasin_canon
+where a.code_magasin_canon is not null
+order by 1
+"""
+
+    df = read_df(sql, params=tuple(list(parc_params) + achats_params))
+
+    if df.empty:
+        return []
+
+    return df["code_magasin"].astype(str).str.strip().tolist()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def count_distinct_franchises_from_codes(code_magasin_list: tuple[str, ...]) -> int:
+    if not code_magasin_list:
+        return 0
+
+    sql = """
+    select count(*) as nb_franchises
+    from (
+        select distinct
+            upper(trim(coalesce(prenom_franchise,''))) || '||' ||
+            upper(trim(coalesce(nom_franchise,''))) as franchise_key
+        from public.ref_magasin
+        where trim(code_magasin::text) = any(%s::text[])
+          and (
+            trim(coalesce(prenom_franchise, '')) <> ''
+            or trim(coalesce(nom_franchise, '')) <> ''
+          )
+    ) t
+    """
+
+    df = read_df(sql, params=(list(code_magasin_list),))
+
+    if df.empty:
+        return 0
+
+    return int(df.iloc[0]["nb_franchises"] or 0)
+
+
+# =============================================================================
+# KPI FRANCHISÉS (calculé à partir des KPI magasins)
+# =============================================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def achats_kpi_franchises_from_kpi_magasins(
+    mags_cte_sql_: str,
+    mags_cte_params_: tuple,
+    code_op: str
+) -> pd.Series:
+    codes_parc = get_codes_parc_sales(mags_cte_sql_, mags_cte_params_)
+    codes_achats = get_codes_mag_achats_references(mags_cte_sql_, mags_cte_params_, code_op)
+
+    nb_franchises_parc = count_distinct_franchises_from_codes(tuple(codes_parc))
+    nb_franchises_achats = count_distinct_franchises_from_codes(tuple(codes_achats))
+
+    pct = 0.0
+    if nb_franchises_parc > 0:
+        pct = round(nb_franchises_achats / nb_franchises_parc * 100, 1)
+
+    return pd.Series(
+        {
+            "nb_franchises_parc": nb_franchises_parc,
+            "nb_franchises_achats": nb_franchises_achats,
+            "pct_franchises_achats": pct,
+        }
+    )
 
 
 # =============================================================================
@@ -689,11 +895,9 @@ if code_magasin_selected:
 
 else:
     with st.spinner(SPINNER_TXT):
-        # ✅ parc ventes strict : si rien dans le parc, on stop
         if not has_sales_parc(mags_cte_sql_A, mags_cte_params_A):
             no_data_block("Aucun magasin dans le parc VENTES (tickets) avec les filtres actuels.")
 
-        # ✅ data achats réelle (sur parc ventes) : si rien, message générique (sans stop)
         hasAchA = has_achats_for_sales_parc(mags_cte_sql_A, mags_cte_params_A, code_opA)
         hasAchB = has_achats_for_sales_parc(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
@@ -755,6 +959,42 @@ else:
                 formatter=lambda x: f"{float(x or 0):.1f} %",
             )
 
+        with st.spinner(SPINNER_TXT):
+            fA = achats_kpi_franchises_from_kpi_magasins(mags_cte_sql_A, mags_cte_params_A, code_opA)
+            fB = achats_kpi_franchises_from_kpi_magasins(mags_cte_sql_B, mags_cte_params_B, code_opB)
+
+        st.divider()
+        st.markdown("## 👤 Franchisés – Synthèse")
+
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            kpi_card_compare(
+                title="Parc franchisés (ventes)",
+                value_n=_f0(fA.get("nb_franchises_parc")),
+                value_n1=_f0(fB.get("nb_franchises_parc")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_int(x),
+            )
+        with fc2:
+            kpi_card_compare(
+                title="Nb franchisés en achats référencés",
+                value_n=_f0(fA.get("nb_franchises_achats")),
+                value_n1=_f0(fB.get("nb_franchises_achats")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: fmt_int(x),
+            )
+        with fc3:
+            kpi_card_compare(
+                title="% franchisés en achats référencés",
+                value_n=_f0(fA.get("pct_franchises_achats")),
+                value_n1=_f0(fB.get("pct_franchises_achats")),
+                label_n=lib_opA,
+                label_n1=lib_opB,
+                formatter=lambda x: f"{float(x or 0):.1f} %",
+            )
+
         st.divider()
 
         st.markdown("## 🥧 Répartition des magasins selon le fournisseur d’achat")
@@ -774,10 +1014,41 @@ else:
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(f"### {lib_opA}")
-            render_pie_with_shared_palette(dfA, all_labels, color_map)
+            render_pie_with_shared_palette(dfA, all_labels, color_map, value_label="Nb magasins")
         with c2:
             st.markdown(f"### {lib_opB}")
-            render_pie_with_shared_palette(dfB, all_labels, color_map)
+            render_pie_with_shared_palette(dfB, all_labels, color_map, value_label="Nb magasins")
+
+        st.divider()
+
+        st.markdown("## 👤 Répartition des franchisés selon le fournisseur d’achat")
+        st.caption(
+            "Répartition en **nombre de franchisés** : un franchisé est compté pour **chaque fournisseur** "
+            "chez qui il a commandé sur l’ensemble de ses magasins du parc."
+        )
+
+        with st.spinner(SPINNER_TXT):
+            dfFrA = camembert_fusion_franchise_parc_sales(
+                mags_cte_sql_A, mags_cte_params_A, code_opA, top_n_fournisseurs=12
+            )
+            dfFrB = camembert_fusion_franchise_parc_sales(
+                mags_cte_sql_B, mags_cte_params_B, code_opB, top_n_fournisseurs=12
+            )
+
+        all_labels_fr = sorted(set(dfFrA["fournisseur"].tolist()) | set(dfFrB["fournisseur"].tolist()))
+        non_captes_fr = "Autres fournisseurs (non captés)"
+        if non_captes_fr in all_labels_fr:
+            all_labels_fr = [x for x in all_labels_fr if x != non_captes_fr] + [non_captes_fr]
+
+        color_map_fr = build_color_map(all_labels_fr)
+
+        cfr1, cfr2 = st.columns(2)
+        with cfr1:
+            st.markdown(f"### {lib_opA}")
+            render_pie_with_shared_palette(dfFrA, all_labels_fr, color_map_fr, value_label="Nb franchisés")
+        with cfr2:
+            st.markdown(f"### {lib_opB}")
+            render_pie_with_shared_palette(dfFrB, all_labels_fr, color_map_fr, value_label="Nb franchisés")
 
         st.divider()
 
