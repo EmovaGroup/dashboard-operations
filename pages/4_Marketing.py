@@ -46,6 +46,8 @@ POIDS_MV_MAP = {
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
     "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
     "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
+    "rosesx5_2026": "public.mv_rose_2026_poids_op_periode_op_magasin",
+    "rosesx5_2025": "public.mv_rose_2025_poids_op_periode_op_magasin",
 }
 
 SPINNER_TXT = "Données en cours de chargement… merci de patienter."
