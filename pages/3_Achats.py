@@ -6,6 +6,9 @@
 # ✅ On se fit AU PARC VENTES (tickets) via `mags` (déjà filtré comparable/parc/ermes/fid/etc.)
 # ✅ Puis on affiche la data Achats UNIQUEMENT sur ce parc
 # ❌ On n'ajoute PLUS les magasins acheteurs hors parc ventes
+# ✅ Aligné avec Global / Commerce :
+#    - normalisation upper(trim(...)) des codes magasin
+#    - canonisation ancien_code -> code_magasin pour la partie ventes
 # =============================================================================
 
 import streamlit as st
@@ -64,7 +67,7 @@ mags_cte_params_A = ctx["mags_cte_params_A"]
 mags_cte_sql_B = ctx["mags_cte_sql_B"]
 mags_cte_params_B = ctx["mags_cte_params_B"]
 
-code_magasin_selected = ctx["filters"]["code_magasin"]
+code_magasin_selected = (ctx["filters"]["code_magasin"] or "").strip().upper() or None
 
 st.caption(f"Opération A : **{lib_opA}**  |  Opération B : **{lib_opB}**")
 
@@ -80,7 +83,7 @@ CODE_MAP_VIEW = "public.vw_param_magasin_ancien_code"
 
 
 # =============================================================================
-# Helpers Python (safe casts)
+# Helpers Python (safe casts / normalisation)
 # =============================================================================
 def _f0(x) -> float:
     try:
@@ -89,6 +92,24 @@ def _f0(x) -> float:
         return float(x)
     except Exception:
         return 0.0
+
+
+def _norm_code(x: str | None) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip().upper()
+    return s or None
+
+
+def _norm_code_list(codes) -> list[str]:
+    if not codes:
+        return []
+    out = []
+    for c in codes:
+        s = _norm_code(c)
+        if s:
+            out.append(s)
+    return sorted(set(out))
 
 
 # =============================================================================
@@ -123,6 +144,7 @@ def build_color_map(labels: list[str]) -> dict:
 
 # =============================================================================
 # COMMERCE LIGHT — CA / Tickets / PM (sur la période)
+# ✅ CORRIGÉ : canonisation ventes comme Global / Commerce
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def load_commerce_light(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> dict:
@@ -131,20 +153,28 @@ def load_commerce_light(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut:
 
 base as (
   select
-    trim(st.code_magasin::text) as code_magasin,
+    coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) as code_magasin,
     st.ticket_date,
     coalesce(st.nb_tickets, 0)::numeric as nb_tickets,
     coalesce(st.total_ttc_net, 0)::numeric as ca_ttc_net
   from public.vw_gold_tickets_jour_clean_op st
-  join mags m on m.code_magasin = trim(st.code_magasin::text)
+  left join {CODE_MAP_VIEW} mp
+    on upper(trim(st.code_magasin::text)) = mp.ancien_code
   where st.ticket_date >= %s::date
     and st.ticket_date <= %s::date
+),
+
+filtered as (
+  select b.*
+  from base b
+  join mags m
+    on upper(trim(m.code_magasin::text)) = b.code_magasin
 )
 select
   round(coalesce(sum(ca_ttc_net),0), 2) as ca_total,
   round(coalesce(sum(nb_tickets),0), 0) as tickets_total,
   round(coalesce(sum(ca_ttc_net),0) / nullif(coalesce(sum(nb_tickets),0),0), 2) as panier_moyen
-from base;
+from filtered;
 """
     df = read_df(sql, params=tuple(list(mags_cte_params_) + [date_debut, date_fin]))
     if df.empty:
@@ -163,9 +193,10 @@ from base;
 # =============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def magasin_info_query(code_magasin: str) -> pd.Series:
+    code_magasin = _norm_code(code_magasin)
     sql = """
     select
-      trim(rm.code_magasin::text) as code_magasin,
+      upper(trim(rm.code_magasin::text)) as code_magasin,
       rm.nom_magasin,
       rm.telephone,
       rm.e_mail,
@@ -181,7 +212,7 @@ def magasin_info_query(code_magasin: str) -> pd.Series:
       rm.prenom_franchise,
       rm.telephone_franchise
     from public.ref_magasin rm
-    where trim(rm.code_magasin::text) = %s
+    where upper(trim(rm.code_magasin::text)) = %s
     limit 1;
     """
     df = read_df(sql, params=(code_magasin,))
@@ -273,13 +304,14 @@ a_norm as (
 
 # =============================================================================
 # PARC VENTES STRICT (comme Commerce/Marketing)
+# ✅ CORRIGÉ : normalisation du parc
 # =============================================================================
 def _parc_sales_cte(mags_cte_sql_: str, mags_cte_params_: tuple) -> tuple[str, tuple]:
     sql = f"""
 {mags_cte_sql_},
 
 parc_sales as (
-  select distinct code_magasin
+  select distinct upper(trim(code_magasin::text)) as code_magasin
   from mags
   where code_magasin is not null
 )
@@ -314,13 +346,14 @@ def _info_no_achats_generic():
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def has_data_for_magasin(code_op: str, code_magasin: str) -> bool:
+    code_magasin = _norm_code(code_magasin)
     sql_cte, _ = _achats_norm_cte(code_op)
     sql = f"""
 with
 {sql_cte}
 select 1
 from a_norm a
-where a.code_magasin_canon = upper(trim(%s::text))
+where a.code_magasin_canon = %s
 limit 1;
 """
     df = read_df(sql, params=(code_op, code_magasin))
@@ -363,6 +396,7 @@ limit 1;
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def achats_kpi_magasin(code_op: str, code_magasin: str) -> pd.Series:
+    code_magasin = _norm_code(code_magasin)
     sql_cte, _ = _achats_norm_cte(code_op)
     sql = f"""
 with
@@ -372,7 +406,7 @@ select
   coalesce(sum(a.quantite),0) as volume_achats_capte,
   coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
 from a_norm a
-where a.code_magasin_canon = upper(trim(%s::text));
+where a.code_magasin_canon = %s;
 """
     df = read_df(sql, params=(code_op, code_magasin))
     if df.empty:
@@ -382,6 +416,7 @@ where a.code_magasin_canon = upper(trim(%s::text));
 
 @st.cache_data(ttl=600, show_spinner=False)
 def pum_par_fournisseur_magasin(code_op: str, code_magasin: str) -> pd.DataFrame:
+    code_magasin = _norm_code(code_magasin)
     sql_cte, _ = _achats_norm_cte(code_op)
     sql = f"""
 with
@@ -392,7 +427,7 @@ select
   coalesce(sum(a."total achat"),0) as valeur,
   coalesce(sum(a."total achat") / nullif(sum(a.quantite)::numeric,0), 0) as pum
 from a_norm a
-where a.code_magasin_canon = upper(trim(%s::text))
+where a.code_magasin_canon = %s
 group by 1
 order by valeur desc;
 """
@@ -548,7 +583,7 @@ def camembert_fusion_franchise_parc_sales(
 
 ref_franchise as (
   select
-    trim(rm.code_magasin::text) as code_magasin,
+    upper(trim(rm.code_magasin::text)) as code_magasin,
     upper(trim(coalesce(rm.prenom_franchise,''))) || '||' ||
     upper(trim(coalesce(rm.nom_franchise,''))) as franchise_key
   from public.ref_magasin rm
@@ -699,7 +734,7 @@ order by 1
     if df.empty:
         return []
 
-    return df["code_magasin"].astype(str).str.strip().tolist()
+    return _norm_code_list(df["code_magasin"].tolist())
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -727,12 +762,13 @@ order by 1
     if df.empty:
         return []
 
-    return df["code_magasin"].astype(str).str.strip().tolist()
+    return _norm_code_list(df["code_magasin"].tolist())
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def count_distinct_franchises_from_codes(code_magasin_list: tuple[str, ...]) -> int:
-    if not code_magasin_list:
+    codes = _norm_code_list(code_magasin_list)
+    if not codes:
         return 0
 
     sql = """
@@ -742,7 +778,7 @@ def count_distinct_franchises_from_codes(code_magasin_list: tuple[str, ...]) -> 
             upper(trim(coalesce(prenom_franchise,''))) || '||' ||
             upper(trim(coalesce(nom_franchise,''))) as franchise_key
         from public.ref_magasin
-        where trim(code_magasin::text) = any(%s::text[])
+        where upper(trim(code_magasin::text)) = any(%s::text[])
           and (
             trim(coalesce(prenom_franchise, '')) <> ''
             or trim(coalesce(nom_franchise, '')) <> ''
@@ -750,7 +786,7 @@ def count_distinct_franchises_from_codes(code_magasin_list: tuple[str, ...]) -> 
     ) t
     """
 
-    df = read_df(sql, params=(list(code_magasin_list),))
+    df = read_df(sql, params=(codes,))
 
     if df.empty:
         return 0
