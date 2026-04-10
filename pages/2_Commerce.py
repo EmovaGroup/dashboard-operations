@@ -1,6 +1,7 @@
 # pages/2_Commerce.py
 # -----------------------------------------------------------------------------
 # COMMERCE — Dashboard (A vs B)
+# ✅ Aligné avec GLOBAL sur le chargement des magasins et la lecture des ventes
 # ✅ Comparable / Non comparable / Tous appliqué partout
 # ✅ Spinners custom partout ("Données en cours de chargement… merci de patienter.")
 # ✅ FIX TIMEOUT : on calcule les magasins (mags) UNE SEULE FOIS -> puis ANY(%s)
@@ -8,6 +9,9 @@
 # ✅ Tables “plus marketing” : € + % + intitulés plus propres
 # ✅ FIX A=B (ex: Saint Valentin 2026 vs Saint Valentin 2026) :
 #    - labels display distincts (A)/(B) pour éviter colonnes dupliquées
+# ✅ FIX GLOBAL STYLE :
+#    - _norm_code_list sur les parcs A/B
+#    - canonisation des ventes via vw_param_magasin_ancien_code
 # -----------------------------------------------------------------------------
 
 import io
@@ -35,6 +39,8 @@ OP_MV_PERIODE = {
     "anniversaire_2024": "public.mv_anniversaire_2024_periode_op_magasin",
     "tulipe_2026": "public.mv_tulipe_2026_periode_op_magasin",
     "tulipe_2025": "public.mv_tulipe_2025_periode_op_magasin",
+    "rosesx5_2025": "public.mv_rose_2025_periode_op_magasin",
+    "rosesx5_2026": "public.mv_rose_2026_periode_op_magasin",
 }
 
 OP_MV_POIDS = {
@@ -45,12 +51,19 @@ OP_MV_POIDS = {
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
     "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
     "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
+    "rosesx5_2026": "public.mv_rose_2026_poids_op_periode_op_magasin",
+    "rosesx5_2025": "public.mv_rose_2025_poids_op_periode_op_magasin",
 }
 
 # ⚠️ Ops "non produit / non nationale produit" : pas de poids OP / pas d'indicateurs produits OP
 OPS_SANS_PRODUIT = {
     "st_valentin_2026",
     "st_valentin_2025",
+    "fdgm_2025",
+    "fdgm_2026",
+    "nouvel_an_2024",
+    "nouvel_an_2025",
+    "rochhachana_2024",
     # ajoute ici d’autres opérations locales si besoin
 }
 
@@ -59,6 +72,7 @@ OPS_SANS_PRODUIT = {
 # HELPERS
 # =============================================================================
 SPINNER_TXT = "Données en cours de chargement… merci de patienter."
+
 
 def _safe_float(x) -> float:
     try:
@@ -86,6 +100,19 @@ def _distinct_labels_for_display(label_A: str, label_B: str):
     if a and (a == b):
         return f"{a} (A)", f"{b} (B)"
     return a, b
+
+
+def _norm_code_list(codes):
+    if not codes:
+        return []
+    out = []
+    for c in codes:
+        if c is None:
+            continue
+        s = str(c).strip().upper()
+        if s:
+            out.append(s)
+    return sorted(set(out))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -299,9 +326,11 @@ select
   round(coalesce(sum(st.total_ttc_net),0) / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as panier_moyen,
   round(coalesce(sum(st.qte_article),0) / nullif(coalesce(sum(st.nb_tickets),0),0), 2) as indice_vente
 from public.vw_gold_tickets_jour_clean_op st
+left join public.vw_param_magasin_ancien_code mp
+  on mp.ancien_code = upper(trim(st.code_magasin::text))
 where st.ticket_date >= %s::date
   and st.ticket_date <= %s::date
-  and upper(trim(st.code_magasin::text)) = any(%s);
+  and coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) = any(%s);
 """
     df = read_df(sql, (date_debut, date_fin, codes))
     if df.empty:
@@ -324,13 +353,15 @@ def load_store_totals_for_map_from_codes(codes: list[str], date_debut: str, date
 
     sql = """
 select
-  upper(trim(st.code_magasin::text)) as code_magasin,
+  coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) as code_magasin,
   coalesce(sum(st.total_ttc_net),0)::numeric as ca,
   coalesce(sum(st.nb_tickets),0)::numeric as tickets
 from public.vw_gold_tickets_jour_clean_op st
+left join public.vw_param_magasin_ancien_code mp
+  on mp.ancien_code = upper(trim(st.code_magasin::text))
 where st.ticket_date >= %s::date
   and st.ticket_date <= %s::date
-  and upper(trim(st.code_magasin::text)) = any(%s)
+  and coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) = any(%s)
 group by 1;
 """
     return read_df(sql, (date_debut, date_fin, codes))
@@ -350,9 +381,11 @@ with base as (
     coalesce(sum(st.qte_article),0)::numeric as qte_article,
     coalesce(sum(st.total_ttc_net),0)::numeric as ca_ttc_net
   from public.vw_gold_tickets_jour_clean_op st
+  left join public.vw_param_magasin_ancien_code mp
+    on mp.ancien_code = upper(trim(st.code_magasin::text))
   where st.ticket_date >= %s::date
     and st.ticket_date <= %s::date
-    and upper(trim(st.code_magasin::text)) = any(%s)
+    and coalesce(mp.code_magasin, upper(trim(st.code_magasin::text))) = any(%s)
   group by st.ticket_date, day_index
 )
 select
@@ -486,10 +519,10 @@ mvB_poids = OP_MV_POIDS.get(code_opB)
 isA_sans_produit = code_opA in OPS_SANS_PRODUIT
 isB_sans_produit = code_opB in OPS_SANS_PRODUIT
 
-# ✅ FIX TIMEOUT : on récupère UNE fois la liste magasins A/B
+# ✅ FIX TIMEOUT + alignement GLOBAL
 with st.spinner(SPINNER_TXT):
-    magsA_codes = fetch_selected_mags(mags_cte_sql_A, mags_cte_params_A)
-    magsB_codes = fetch_selected_mags(mags_cte_sql_B, mags_cte_params_B)
+    magsA_codes = _norm_code_list(fetch_selected_mags(mags_cte_sql_A, mags_cte_params_A))
+    magsB_codes = _norm_code_list(fetch_selected_mags(mags_cte_sql_B, mags_cte_params_B))
 
 nb_mag_selected_A = len(magsA_codes)
 nb_mag_selected_B = len(magsB_codes)
