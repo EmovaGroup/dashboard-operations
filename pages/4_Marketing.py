@@ -16,6 +16,11 @@
 #
 # ✅ FIX StreamlitDuplicateElementId (plotly_chart) :
 # - ajouter un `key=` unique sur CHAQUE st.plotly_chart
+#
+# ✅ ALIGNEMENT GLOBAL / COMMERCE :
+# - normalisation upper(trim(...)) sur tous les codes magasin
+# - canonisation ancien_code -> code_magasin sur les données ventes / marketing / poids
+# - jointure avec le parc filtré via codes canoniques
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -60,6 +65,24 @@ def _safe_float(x) -> float:
         return float(x or 0)
     except Exception:
         return 0.0
+
+
+def _norm_code(x) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip().upper()
+    return s or None
+
+
+def _norm_code_list(values) -> list[str]:
+    if not values:
+        return []
+    out = []
+    for v in values:
+        s = _norm_code(v)
+        if s:
+            out.append(s)
+    return sorted(set(out))
 
 
 def _as_rate01(v: float) -> float:
@@ -194,7 +217,7 @@ def _plot_reg(
     dfB: pd.DataFrame,
     label_A: str,
     label_B: str,
-    key: str,  # ✅ clé unique Streamlit
+    key: str,
 ):
     fig = go.Figure()
     y_decimals = 4 if y_col in ("poids_ca", "poids_volume") else 2
@@ -215,7 +238,7 @@ def _plot_reg(
 
 # =============================================================================
 # Loader — “Commerce light” (CA / tickets / panier moyen) sur la période
-# ✅ map2 (pas map) pour éviter collision avec filters.py
+# ✅ aligné Global / Commerce
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def load_commerce_light(mags_cte_sql_: str, mags_cte_params_: tuple, date_debut: str, date_fin: str) -> dict:
@@ -238,17 +261,22 @@ base as (
   from public.vw_gold_tickets_jour_clean_op st
   left join map2 m2
     on m2.ancien_code = upper(trim(st.code_magasin::text))
-  join mags m
-    on m.code_magasin = coalesce(m2.code_magasin, upper(trim(st.code_magasin::text)))
   where st.ticket_date >= %s::date
     and st.ticket_date <= %s::date
+),
+
+filtered as (
+  select b.*
+  from base b
+  join mags m
+    on upper(trim(m.code_magasin::text)) = b.code_magasin
 )
 
 select
   round(coalesce(sum(ca_ttc_net),0), 2) as ca_total,
   round(coalesce(sum(nb_tickets),0), 0) as tickets_total,
   round(coalesce(sum(ca_ttc_net),0) / nullif(coalesce(sum(nb_tickets),0),0), 2) as panier_moyen
-from base;
+from filtered;
 """
     df = read_df(sql, tuple(list(mags_cte_params_) + [date_debut, date_fin]))
     if df.empty:
@@ -264,7 +292,7 @@ from base;
 
 # =============================================================================
 # Loader — métriques marketing (A ou B) sur le parc filtré
-# ✅ map2 (pas map)
+# ✅ aligné Global / Commerce
 # =============================================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def load_marketing_metrics(mags_cte_sql_: str, mags_cte_params_: tuple, code_operation: str) -> dict:
@@ -294,7 +322,10 @@ ermes as (
     and e.code_magasin is not null
 ),
 ermes_mags as (
-  select e.* from ermes e join mags m using(code_magasin)
+  select e.*
+  from ermes e
+  join mags m
+    on upper(trim(m.code_magasin::text)) = e.code_magasin
 ),
 
 ktb_cost as (
@@ -310,7 +341,10 @@ ktb_cost as (
     and k.code_magasin is not null
 ),
 ktb_cost_mags as (
-  select k.* from ktb_cost k join mags m using(code_magasin)
+  select k.*
+  from ktb_cost k
+  join mags m
+    on upper(trim(m.code_magasin::text)) = k.code_magasin
 ),
 
 ktb_ori as (
@@ -324,7 +358,10 @@ ktb_ori as (
     and o.code_magasin is not null
 ),
 ktb_ori_mags as (
-  select o.* from ktb_ori o join mags m using(code_magasin)
+  select o.*
+  from ktb_ori o
+  join mags m
+    on upper(trim(m.code_magasin::text)) = o.code_magasin
 ),
 
 agg as (
@@ -502,16 +539,18 @@ ktb as (
 
 base as (
   select
-    m.code_magasin,
+    upper(trim(m.code_magasin::text)) as code_magasin,
     coalesce({region_field_sql}, 'Non renseigné') as region,
     coalesce(e.invest_ermes_eur, 0) as invest_ermes_eur,
     coalesce(k.invest_fid_eur, 0) as invest_fid_eur,
     coalesce(e.invest_ermes_eur, 0) + coalesce(k.invest_fid_eur, 0) as invest_total_eur
   from mags m
-  left join ermes e using(code_magasin)
-  left join ktb   k using(code_magasin)
+  left join ermes e
+    on e.code_magasin = upper(trim(m.code_magasin::text))
+  left join ktb k
+    on k.code_magasin = upper(trim(m.code_magasin::text))
   left join public.ref_magasin rm
-    on upper(trim(rm.code_magasin::text)) = m.code_magasin
+    on upper(trim(rm.code_magasin::text)) = upper(trim(m.code_magasin::text))
 )
 
 select
@@ -567,11 +606,14 @@ ermes as (
   where e.code_operation = %s
     and e.code_magasin is not null
 ),
+
 ermes_mags as (
   select e.*
   from ermes e
-  join mags m using(code_magasin)
+  join mags m
+    on upper(trim(m.code_magasin::text)) = e.code_magasin
 )
+
 select
   pack_eur,
   count(*) as nb_magasin
@@ -656,11 +698,13 @@ fid as (
 ),
 invest as (
   select
-    m.code_magasin,
+    upper(trim(m.code_magasin::text)) as code_magasin,
     (coalesce(e.invest_ermes_eur, 0) + coalesce(f.invest_fid_eur, 0))::numeric as invest_eur
   from mags m
-  left join ermes e using(code_magasin)
-  left join fid   f using(code_magasin)
+  left join ermes e
+    on e.code_magasin = upper(trim(m.code_magasin::text))
+  left join fid f
+    on f.code_magasin = upper(trim(m.code_magasin::text))
 )
 """.strip()
         params_extra = [code_operation, code_operation]
@@ -681,13 +725,15 @@ poids as (
 )
 
 select
-  m.code_magasin,
+  upper(trim(m.code_magasin::text)) as code_magasin,
   coalesce(i.invest_eur, 0)::numeric as invest_eur,
   coalesce(p.poids_ca, 0)::numeric as poids_ca,
   coalesce(p.poids_volume, 0)::numeric as poids_volume
 from mags m
-left join invest i using(code_magasin)
-left join poids  p using(code_magasin)
+left join invest i
+  on i.code_magasin = upper(trim(m.code_magasin::text))
+left join poids p
+  on p.code_magasin = upper(trim(m.code_magasin::text))
 where p.code_magasin is not null;
 """
     params = tuple(list(mags_cte_params_) + params_extra)
@@ -699,7 +745,7 @@ where p.code_magasin is not null;
     df["invest_eur"] = pd.to_numeric(df["invest_eur"], errors="coerce").fillna(0.0)
     df["poids_ca"] = pd.to_numeric(df["poids_ca"], errors="coerce").fillna(0.0)
     df["poids_volume"] = pd.to_numeric(df["poids_volume"], errors="coerce").fillna(0.0)
-    df["code_magasin"] = df["code_magasin"].astype(str)
+    df["code_magasin"] = df["code_magasin"].astype(str).str.strip().str.upper()
     return df
 
 
@@ -731,7 +777,6 @@ mags_cte_params_A = ctx["mags_cte_params_A"]
 mags_cte_sql_B = ctx["mags_cte_sql_B"]
 mags_cte_params_B = ctx["mags_cte_params_B"]
 
-# ✅ labels display distincts si A == B
 label_A, label_B = _distinct_labels_for_display(lib_opA, lib_opB)
 
 # =============================================================================
@@ -762,32 +807,92 @@ with st.spinner(SPINNER_TXT):
     mA = load_marketing_metrics(mags_cte_sql_A, mags_cte_params_A, code_opA)
     mB = load_marketing_metrics(mags_cte_sql_B, mags_cte_params_B, code_opB)
 
-# --- TOTAL
 rt1, rt2, rt3 = st.columns(3)
 with rt1:
-    kpi_card_compare("TOTAL – Investissement (ERMES + FID)", mA["invest_total_eur"], mB["invest_total_eur"], label_A, label_B, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare(
+        "TOTAL – Investissement (ERMES + FID)",
+        mA["invest_total_eur"],
+        mB["invest_total_eur"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_money(x, 0),
+    )
 with rt2:
-    kpi_card_compare("TOTAL – Moyen / magasin (marketing)", mA["invest_total_moy_eur"], mB["invest_total_moy_eur"], label_A, label_B, formatter=lambda x: fmt_money(x, 2))
+    kpi_card_compare(
+        "TOTAL – Moyen / magasin (marketing)",
+        mA["invest_total_moy_eur"],
+        mB["invest_total_moy_eur"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_money(x, 2),
+    )
 with rt3:
-    kpi_card_compare("CA actifs (FID) — ori_ktb.ca_actifs", mA["ca_actifs_total"], mB["ca_actifs_total"], label_A, label_B, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare(
+        "CA actifs (FID) — ori_ktb.ca_actifs",
+        mA["ca_actifs_total"],
+        mB["ca_actifs_total"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_money(x, 0),
+    )
 
-# --- ERMES
 re1, re2, re3 = st.columns(3)
 with re1:
-    kpi_card_compare("ERMES – Nb magasins pack", mA["nb_mag_ermes"], mB["nb_mag_ermes"], label_A, label_B, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(
+        "ERMES – Nb magasins pack",
+        mA["nb_mag_ermes"],
+        mB["nb_mag_ermes"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_int(x),
+    )
 with re2:
-    kpi_card_compare("ERMES – Investissement PACK (Total)", mA["invest_ermes_total_eur"], mB["invest_ermes_total_eur"], label_A, label_B, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare(
+        "ERMES – Investissement PACK (Total)",
+        mA["invest_ermes_total_eur"],
+        mB["invest_ermes_total_eur"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_money(x, 0),
+    )
 with re3:
-    kpi_card_compare("ERMES – % magasins (sur parc)", mA["pct_mag_ermes"], mB["pct_mag_ermes"], label_A, label_B, formatter=lambda x: f"{float(x or 0):.1f} %")
+    kpi_card_compare(
+        "ERMES – % magasins (sur parc)",
+        mA["pct_mag_ermes"],
+        mB["pct_mag_ermes"],
+        label_A,
+        label_B,
+        formatter=lambda x: f"{float(x or 0):.1f} %",
+    )
 
-# --- FID / KTB
 rf1, rf2, rf3, rf4 = st.columns(4)
 with rf1:
-    kpi_card_compare("KTB – Nb magasins", mA["nb_mag_ktb"], mB["nb_mag_ktb"], label_A, label_B, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(
+        "KTB – Nb magasins",
+        mA["nb_mag_ktb"],
+        mB["nb_mag_ktb"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_int(x),
+    )
 with rf2:
-    kpi_card_compare("KTB – Investissement SMS (Total)", mA["invest_ktb_total_eur"], mB["invest_ktb_total_eur"], label_A, label_B, formatter=lambda x: fmt_money(x, 0))
+    kpi_card_compare(
+        "KTB – Investissement SMS (Total)",
+        mA["invest_ktb_total_eur"],
+        mB["invest_ktb_total_eur"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_money(x, 0),
+    )
 with rf3:
-    kpi_card_compare("KTB – Nb SMS envoyés", mA["nb_sms_total"], mB["nb_sms_total"], label_A, label_B, formatter=lambda x: fmt_int(x))
+    kpi_card_compare(
+        "KTB – Nb SMS envoyés",
+        mA["nb_sms_total"],
+        mB["nb_sms_total"],
+        label_A,
+        label_B,
+        formatter=lambda x: fmt_int(x),
+    )
 with rf4:
     kpi_card_compare(
         "Taux d’activation fidèles (KTB)",
@@ -798,12 +903,18 @@ with rf4:
         formatter=lambda x: f"{float(x or 0):.1f} %",
     )
 
-# --- Parc & marketing
 rp1, rp2 = st.columns(2)
 with rp1:
     kpi_card_compare("Parc magasins", mA["parc_magasin"], mB["parc_magasin"], label_A, label_B, formatter=lambda x: fmt_int(x))
 with rp2:
-    kpi_card_compare("% magasins marketing (ERMES ou KTB)", mA["pct_mag_marketing"], mB["pct_mag_marketing"], label_A, label_B, formatter=lambda x: f"{float(x or 0):.1f} %")
+    kpi_card_compare(
+        "% magasins marketing (ERMES ou KTB)",
+        mA["pct_mag_marketing"],
+        mB["pct_mag_marketing"],
+        label_A,
+        label_B,
+        formatter=lambda x: f"{float(x or 0):.1f} %",
+    )
 
 st.divider()
 
@@ -812,8 +923,20 @@ st.divider()
 # =============================================================================
 st.markdown("## 🌍 Investissement marketing par région (Opération A)")
 with st.spinner(SPINNER_TXT):
-    _render_region_table('rm."crp_:_region_elargie"', "Par région élargie", mags_cte_sql_A, mags_cte_params_A, code_opA)
-    _render_region_table('rm."crp_:_region_nationale_d_affectation"', "Par région administrative", mags_cte_sql_A, mags_cte_params_A, code_opA)
+    _render_region_table(
+        'rm."crp_:_region_elargie"',
+        "Par région élargie",
+        mags_cte_sql_A,
+        mags_cte_params_A,
+        code_opA,
+    )
+    _render_region_table(
+        'rm."crp_:_region_nationale_d_affectation"',
+        "Par région administrative",
+        mags_cte_sql_A,
+        mags_cte_params_A,
+        code_opA,
+    )
 
 st.divider()
 
@@ -830,7 +953,13 @@ with c1:
     if df_pack_A.empty:
         st.info(f"Aucune donnée pack ERMES pour {label_A}.")
     else:
-        figA = px.pie(df_pack_A, names="pack_eur", values="nb_magasin", hole=0.45, title=f"Répartition des packs — nb magasins ({label_A})")
+        figA = px.pie(
+            df_pack_A,
+            names="pack_eur",
+            values="nb_magasin",
+            hole=0.45,
+            title=f"Répartition des packs — nb magasins ({label_A})",
+        )
         figA.update_traces(textinfo="percent+label")
         st.plotly_chart(figA, use_container_width=True, key=f"pie_pack_A_{code_opA}")
 
@@ -838,7 +967,13 @@ with c2:
     if df_pack_B.empty:
         st.info(f"Aucune donnée pack ERMES pour {label_B}.")
     else:
-        figB = px.pie(df_pack_B, names="pack_eur", values="nb_magasin", hole=0.45, title=f"Répartition des packs — nb magasins ({label_B})")
+        figB = px.pie(
+            df_pack_B,
+            names="pack_eur",
+            values="nb_magasin",
+            hole=0.45,
+            title=f"Répartition des packs — nb magasins ({label_B})",
+        )
         figB.update_traces(textinfo="percent+label")
         st.plotly_chart(figB, use_container_width=True, key=f"pie_pack_B_{code_opB}")
 
@@ -852,7 +987,6 @@ st.markdown("## 📈 Régressions linéaires — Poids OP vs investissement (A v
 poids_mv_A = POIDS_MV_MAP.get(code_opA)
 poids_mv_B = POIDS_MV_MAP.get(code_opB)
 
-# ✅ message générique + skip (pas d’arrêt de page)
 if not poids_mv_A or not poids_mv_B:
     _info_no_poids_generic(code_opA, code_opB)
 else:
