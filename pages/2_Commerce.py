@@ -41,6 +41,7 @@ OP_MV_PERIODE = {
     "tulipe_2025": "public.mv_tulipe_2025_periode_op_magasin",
     "rosesx5_2025": "public.mv_rose_2025_periode_op_magasin",
     "rosesx5_2026": "public.mv_rose_2026_periode_op_magasin",
+    "pivoinesx5_2026": "public.mv_pivoine_2026_periode_op_magasin",
 }
 
 OP_MV_POIDS = {
@@ -53,6 +54,7 @@ OP_MV_POIDS = {
     "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
     "rosesx5_2026": "public.mv_rose_2026_poids_op_periode_op_magasin",
     "rosesx5_2025": "public.mv_rose_2025_poids_op_periode_op_magasin",
+    "pivoinesx5_2026": "public.mv_pivoine_2026_poids_op_periode_op_magasin",
 }
 
 # ⚠️ Ops "non produit / non nationale produit" : pas de poids OP / pas d'indicateurs produits OP
