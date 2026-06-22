@@ -52,6 +52,7 @@ POIDS_MV_MAP = {
     "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
     "tulipe_2025": "public.mv_tulipe_2025_poids_op_periode_op_magasin",
     "rosesx5_2026": "public.mv_rose_2026_poids_op_periode_op_magasin",
+    "rosesx5_2025": "public.mv_rose_2025_poids_op_periode_op_magasin",
     "pivoinesx5_2026": "public.mv_pivoine_2026_poids_op_periode_op_magasin",
 }
 
