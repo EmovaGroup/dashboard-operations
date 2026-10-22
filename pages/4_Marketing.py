@@ -47,6 +47,7 @@ POIDS_MV_MAP = {
     "poinsettia_2025": "public.mv_poinsettia_2025_poids_op_periode_op_magasin",
     "noel_2025": "public.mv_noel_2025_poids_op_periode_op_magasin",
     "noel_2024": "public.mv_noel_2024_poids_op_periode_op_magasin",
+    "anniversaire_2026": "public.mv_anniversaire_2026_poids_op_periode_op_magasin",
     "anniversaire_2025": "public.mv_anniversaire_2025_poids_op_periode_op_magasin",
     "anniversaire_2024": "public.mv_anniversaire_2024_poids_op_periode_op_magasin",
     "tulipe_2026": "public.mv_tulipe_2026_poids_op_periode_op_magasin",
